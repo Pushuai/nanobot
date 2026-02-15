@@ -192,6 +192,25 @@ class ChannelManager:
                     self.bus.consume_outbound(),
                     timeout=1.0
                 )
+
+                # Debug log outbound dispatch (best-effort)
+                try:
+                    from nanobot.utils.helpers import get_data_path
+                    from datetime import datetime
+                    import json as _json
+                    log_path = get_data_path() / "bus_outbound.log"
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    preview = msg.content[:200] + ("..." if len(msg.content) > 200 else "")
+                    payload = {
+                        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "channel": msg.channel,
+                        "chat_id": msg.chat_id,
+                        "preview": preview,
+                    }
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
                 
                 channel = self.channels.get(msg.channel)
                 if channel:

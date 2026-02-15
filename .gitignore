@@ -19,4 +19,6 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
+gateway.out.log
+gateway.err.log
 tests/

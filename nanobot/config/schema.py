@@ -214,6 +214,11 @@ class WebToolsConfig(BaseModel):
 class ExecToolConfig(BaseModel):
     """Shell exec tool configuration."""
     timeout: int = 60
+    allow_patterns: list[str] = Field(default_factory=list)
+    deny_patterns: list[str] = Field(default_factory=list)
+    direct_enabled: bool = False  # Allow /exec direct commands
+    direct_prefix: str = "/exec"
+    direct_allow_patterns: list[str] = Field(default_factory=list)
 
 
 class MCPServerConfig(BaseModel):
@@ -232,6 +237,37 @@ class ToolsConfig(BaseModel):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class CodexStreamConfig(BaseModel):
+    """Codex streaming configuration."""
+    enabled: bool = False
+    min_interval_seconds: int = 12
+    max_lines: int = 30
+    max_chars: int = 1200
+
+
+class CodexConfig(BaseModel):
+    """Codex CLI integration configuration."""
+    enabled: bool = False
+    command_prefix: str = "/cx"
+    codex_path: str = "codex"
+    model: str = "gpt-5.3-codex"
+    sandbox: str = "danger-full-access"  # read-only | workspace-write | danger-full-access
+    approval_policy: str = "never"  # untrusted | on-failure | on-request | never
+    reasoning_mode: str = "xhigh"  # xhigh maps to codex high effort
+    allow_from: list[str] = Field(default_factory=list)
+    logs_dir: str = ""
+    work_dir: str = ""
+    use_temp_workspace: bool = True
+    temp_workspace_root: str = ""
+    max_running: int = 2
+    default_args: list[str] = Field(default_factory=list)
+    exec_args: list[str] = Field(default_factory=list)
+    review_args: list[str] = Field(default_factory=list)
+    resume_args: list[str] = Field(default_factory=list)
+    apply_args: list[str] = Field(default_factory=list)
+    stream: CodexStreamConfig = Field(default_factory=CodexStreamConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -239,6 +275,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    codex: CodexConfig = Field(default_factory=CodexConfig)
     
     @property
     def workspace_path(self) -> Path:

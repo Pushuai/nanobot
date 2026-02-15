@@ -109,6 +109,27 @@ class BaseChannel(ABC):
                 f"Add them to allowFrom list in config to grant access."
             )
             return
+
+        # Debug log inbound bus publish (best-effort)
+        try:
+            from nanobot.utils.helpers import get_data_path
+            from datetime import datetime
+            import json
+            log_path = get_data_path() / "bus_inbound.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            preview = content[:200] + ("..." if len(content) > 200 else "")
+            payload = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "channel": self.name,
+                "sender_id": str(sender_id),
+                "chat_id": str(chat_id),
+                "preview": preview,
+                "content_repr": repr(content),
+            }
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
         
         msg = InboundMessage(
             channel=self.name,

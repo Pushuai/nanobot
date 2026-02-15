@@ -131,6 +131,13 @@ nanobot agent -m "What is 2+2?"
 
 That's it! You have a working AI assistant in 2 minutes.
 
+For this fork, a ready-to-edit full example is included at `config.example.json`
+(with Feishu + Codex settings). You can copy it to your local runtime config:
+
+```bash
+cp config.example.json ~/.nanobot/config.json
+```
+
 ## 🖥️ Local Models (vLLM)
 
 Run nanobot with your own local models using vLLM or any OpenAI-compatible server.
@@ -217,6 +224,59 @@ nanobot gateway
 ```
 
 </details>
+
+## Codex (CLI Integration)
+
+Run Codex from chat (e.g., Feishu) with `/cx` commands.
+
+**Config example** (`~/.nanobot/config.json`):
+
+```json
+{
+  "codex": {
+    "enabled": true,
+    "commandPrefix": "/cx",
+    "codexPath": "codex",
+    "model": "gpt-5.3-codex",
+    "sandbox": "danger-full-access",
+    "approvalPolicy": "never",
+    "reasoningMode": "xhigh",
+    "useTempWorkspace": true,
+    "stream": {
+      "enabled": true
+    }
+  }
+}
+```
+
+You can also start from the repository sample:
+
+```bash
+cp config.example.json ~/.nanobot/config.json
+```
+
+**Commands** (from chat):
+- `/cx` (same as `/cx help`)
+- `/cx help`
+- `/cx run <prompt> [-- <codex args>]`
+- `/cx run -n <name> <prompt> [-- <codex args>]`
+- `/cx review [prompt] [-- <codex args>]`
+- `/cx resume <session_id> [prompt] [-- <codex args>]`
+- `/cx apply <task_id> [-- <codex args>]`
+- `/cx list`
+- `/cx sessions [n]`
+- `/cx tail <name> [lines]`
+- `/cx stop <name>`
+- `/cx stream on|off`
+- `/cx bind` (bind current chat as codex notify target)
+- `/cx unbind` (clear notify target)
+
+Behavior notes:
+- Codex replies are sent back as conversational messages (final answer first; not only status lines).
+- Codex notifications are sent as Markdown cards and include workspace/session context.
+- Local Codex sessions on the same machine are monitored; when a session completes, its final answer can be pushed to the bound chat target.
+- `/cx resume [session_id]` will use that session's original workspace (`cwd`) automatically.
+- `/cx run` uses a temporary workspace directory by default (under `<workspace>/.codex-temp-workspaces`).
 
 <details>
 <summary><b>Mochat (Claw IM)</b></summary>

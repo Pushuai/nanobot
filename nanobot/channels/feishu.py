@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import threading
+from datetime import datetime
 from collections import OrderedDict
 from typing import Any
 
@@ -13,6 +14,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import FeishuConfig
+from nanobot.utils.helpers import get_data_path
 
 try:
     import lark_oapi as lark
@@ -23,6 +25,10 @@ try:
         CreateMessageReactionRequestBody,
         Emoji,
         P2ImMessageReceiveV1,
+        P2ImChatAccessEventBotP2pChatEnteredV1,
+        P2ImMessageReactionCreatedV1,
+        P2ImMessageReactionDeletedV1,
+        P2ImMessageMessageReadV1,
     )
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -135,6 +141,14 @@ class FeishuChannel(BaseChannel):
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
+        ).register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
+            self._on_chat_entered_sync
+        ).register_p2_im_message_reaction_created_v1(
+            self._on_message_reaction_created_sync
+        ).register_p2_im_message_reaction_deleted_v1(
+            self._on_message_reaction_deleted_sync
+        ).register_p2_im_message_message_read_v1(
+            self._on_message_read_sync
         ).build()
         
         # Create WebSocket client for long connection
@@ -290,6 +304,23 @@ class FeishuChannel(BaseChannel):
             logger.warning("Feishu client not initialized")
             return
         
+        # Debug log outbound (best-effort)
+        try:
+            log_path = get_data_path() / "feishu_outbound.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            preview = msg.content[:200] + ("..." if len(msg.content) > 200 else "")
+            payload = {
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "chat_id": msg.chat_id,
+                "channel": msg.channel,
+                "preview": preview,
+                "metadata": msg.metadata or {},
+            }
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
         try:
             # Determine receive_id_type based on chat_id format
             # open_id starts with "ou_", chat_id starts with "oc_"
@@ -297,6 +328,28 @@ class FeishuChannel(BaseChannel):
                 receive_id_type = "chat_id"
             else:
                 receive_id_type = "open_id"
+
+            fmt = (msg.metadata or {}).get("format")
+            if fmt == "text":
+                content = json.dumps({"text": msg.content}, ensure_ascii=False)
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(msg.chat_id)
+                        .msg_type("text")
+                        .content(content)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.create(request)
+                if not response.success():
+                    logger.error(
+                        f"Failed to send Feishu message: code={response.code}, "
+                        f"msg={response.msg}, log_id={response.get_log_id()}"
+                    )
+                else:
+                    logger.debug(f"Feishu message sent to {msg.chat_id}")
+                return
             
             # Build card with markdown + table support
             elements = self._build_card_elements(msg.content)
@@ -336,6 +389,29 @@ class FeishuChannel(BaseChannel):
         """
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+
+    def _on_chat_entered_sync(self, data: "P2ImChatAccessEventBotP2pChatEnteredV1") -> None:
+        """Sync handler for bot_p2p_chat_entered events (no-op, prevents SDK error)."""
+        try:
+            event = getattr(data, "event", None)
+            user_id = None
+            if event and getattr(event, "operator_id", None):
+                user_id = event.operator_id.open_id
+            logger.info(f"Feishu event: bot_p2p_chat_entered (operator={user_id or 'unknown'})")
+        except Exception:
+            logger.info("Feishu event: bot_p2p_chat_entered")
+
+    def _on_message_reaction_created_sync(self, data: "P2ImMessageReactionCreatedV1") -> None:
+        """Sync handler for message reaction created (no-op)."""
+        logger.info("Feishu event: message_reaction_created")
+
+    def _on_message_reaction_deleted_sync(self, data: "P2ImMessageReactionDeletedV1") -> None:
+        """Sync handler for message reaction deleted (no-op)."""
+        logger.info("Feishu event: message_reaction_deleted")
+
+    def _on_message_read_sync(self, data: "P2ImMessageMessageReadV1") -> None:
+        """Sync handler for message read (no-op)."""
+        logger.info("Feishu event: message_read")
     
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""
@@ -364,8 +440,7 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type  # "p2p" or "group"
             msg_type = message.message_type
             
-            # Add reaction to indicate "seen"
-            await self._add_reaction(message_id, "THUMBSUP")
+            # No auto-reaction
             
             # Parse message content
             if msg_type == "text":
@@ -382,11 +457,37 @@ class FeishuChannel(BaseChannel):
             else:
                 content = MSG_TYPE_MAP.get(msg_type, f"[{msg_type}]")
             
+            # Log inbound message payload for debugging
+            try:
+                log_path = get_data_path() / "feishu_inbound.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "event": "im.message.receive_v1",
+                    "message_id": message_id,
+                    "chat_id": message.chat_id,
+                    "chat_type": chat_type,
+                    "sender_id": sender_id,
+                    "msg_type": msg_type,
+                    "content": content,
+                    "content_repr": repr(content),
+                    "raw_content": message.content,
+                }
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
             if not content:
                 return
+
+            logger.info(
+                f"Feishu inbound: sender={sender_id} chat_id={message.chat_id} "
+                f"chat_type={chat_type} msg_type={msg_type}"
+            )
             
-            # Forward to message bus
-            reply_to = chat_id if chat_type == "group" else sender_id
+            # Forward to message bus (reply to chat_id for both group and p2p)
+            reply_to = chat_id or sender_id
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,

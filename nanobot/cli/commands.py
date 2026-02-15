@@ -20,13 +20,31 @@ from prompt_toolkit.patch_stdout import patch_stdout
 
 from nanobot import __version__, __logo__
 
+def _supports_unicode() -> bool:
+    """Return True if stdout encoding can handle common symbols used by the CLI."""
+    enc = (sys.stdout.encoding or "").lower()
+    if not enc:
+        return False
+    try:
+        "✓✗".encode(enc)
+        __logo__.encode(enc)
+        return True
+    except Exception:
+        return False
+
+
+_UNICODE_OK = _supports_unicode()
+_LOGO = __logo__ if _UNICODE_OK else "nanobot"
+_CHECK = "✓" if _UNICODE_OK else "OK"
+_CROSS = "✗" if _UNICODE_OK else "X"
+
 app = typer.Typer(
     name="nanobot",
-    help=f"{__logo__} nanobot - Personal AI Assistant",
+    help=f"{_LOGO} nanobot - Personal AI Assistant",
     no_args_is_help=True,
 )
 
-console = Console()
+console = Console(legacy_windows=False, emoji=_UNICODE_OK)
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 
 # ---------------------------------------------------------------------------
@@ -101,7 +119,7 @@ def _print_agent_response(response: str, render_markdown: bool) -> None:
     content = response or ""
     body = Markdown(content) if render_markdown else Text(content)
     console.print()
-    console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+    console.print(f"[cyan]{_LOGO} nanobot[/cyan]")
     console.print(body)
     console.print()
 
@@ -133,7 +151,7 @@ async def _read_interactive_input_async() -> str:
 
 def version_callback(value: bool):
     if value:
-        console.print(f"{__logo__} nanobot v{__version__}")
+        console.print(f"{_LOGO} nanobot v{__version__}")
         raise typer.Exit()
 
 
@@ -168,26 +186,26 @@ def onboard():
         if typer.confirm("Overwrite?"):
             config = Config()
             save_config(config)
-            console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+            console.print(f"[green]{_CHECK}[/green] Config reset to defaults at {config_path}")
         else:
             config = load_config()
             save_config(config)
-            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+            console.print(f"[green]{_CHECK}[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
         save_config(Config())
-        console.print(f"[green]✓[/green] Created config at {config_path}")
+        console.print(f"[green]{_CHECK}[/green] Created config at {config_path}")
     
     # Create workspace
     workspace = get_workspace_path()
     
     if not workspace.exists():
         workspace.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace}")
+        console.print(f"[green]{_CHECK}[/green] Created workspace at {workspace}")
     
     # Create default bootstrap files
     _create_workspace_templates(workspace)
     
-    console.print(f"\n{__logo__} nanobot is ready!")
+    console.print(f"\n{_LOGO} nanobot is ready!")
     console.print("\nNext steps:")
     console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
@@ -315,12 +333,13 @@ def gateway(
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.codex.service import CodexService
     
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
     
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    console.print(f"{_LOGO} Starting nanobot gateway on port {port}...")
     
     config = load_config()
     bus = MessageBus()
@@ -332,6 +351,14 @@ def gateway(
     cron = CronService(cron_store_path)
     
     # Create agent with cron service
+    codex_service = None
+    if config.codex.enabled:
+        codex_service = CodexService(
+            config.codex,
+            bus,
+            default_work_dir=str(config.workspace_path),
+        )
+
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -347,6 +374,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        codex_service=codex_service,
     )
     
     # Set cron callback (needs agent)
@@ -384,30 +412,37 @@ def gateway(
     channels = ChannelManager(config, bus)
     
     if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+        console.print(f"[green]{_CHECK}[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
     
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
-        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+        console.print(f"[green]{_CHECK}[/green] Cron: {cron_status['jobs']} scheduled jobs")
     
-    console.print(f"[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"[green]{_CHECK}[/green] Heartbeat: every 30m")
+    if codex_service:
+        console.print(f"[green]{_CHECK}[/green] Codex integration enabled")
     
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
+            tasks = [
                 agent.run(),
                 channels.start_all(),
-            )
+            ]
+            if codex_service:
+                tasks.append(codex_service.start())
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
             await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
+            if codex_service:
+                codex_service.stop()
             agent.stop()
             await channels.stop_all()
     
@@ -479,7 +514,7 @@ def agent(
     else:
         # Interactive mode
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        console.print(f"{_LOGO} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
 
         def _exit_on_sigint(signum, frame):
             _restore_terminal()
@@ -545,14 +580,14 @@ def channels_status():
     wa = config.channels.whatsapp
     table.add_row(
         "WhatsApp",
-        "✓" if wa.enabled else "✗",
+        _CHECK if wa.enabled else _CROSS,
         wa.bridge_url
     )
 
     dc = config.channels.discord
     table.add_row(
         "Discord",
-        "✓" if dc.enabled else "✗",
+        _CHECK if dc.enabled else _CROSS,
         dc.gateway_url
     )
 
@@ -561,7 +596,7 @@ def channels_status():
     fs_config = f"app_id: {fs.app_id[:10]}..." if fs.app_id else "[dim]not configured[/dim]"
     table.add_row(
         "Feishu",
-        "✓" if fs.enabled else "✗",
+        _CHECK if fs.enabled else _CROSS,
         fs_config
     )
 
@@ -570,7 +605,7 @@ def channels_status():
     mc_base = mc.base_url or "[dim]not configured[/dim]"
     table.add_row(
         "Mochat",
-        "✓" if mc.enabled else "✗",
+        _CHECK if mc.enabled else _CROSS,
         mc_base
     )
     
@@ -579,7 +614,7 @@ def channels_status():
     tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
     table.add_row(
         "Telegram",
-        "✓" if tg.enabled else "✗",
+        _CHECK if tg.enabled else _CROSS,
         tg_config
     )
 
@@ -588,7 +623,7 @@ def channels_status():
     slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
     table.add_row(
         "Slack",
-        "✓" if slack.enabled else "✗",
+        _CHECK if slack.enabled else _CROSS,
         slack_config
     )
 
@@ -627,7 +662,7 @@ def _get_bridge_dir() -> Path:
         console.print("Try reinstalling: pip install --force-reinstall nanobot")
         raise typer.Exit(1)
     
-    console.print(f"{__logo__} Setting up bridge...")
+    console.print(f"{_LOGO} Setting up bridge...")
     
     # Copy to user directory
     user_bridge.parent.mkdir(parents=True, exist_ok=True)
@@ -643,7 +678,7 @@ def _get_bridge_dir() -> Path:
         console.print("  Building...")
         subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
         
-        console.print("[green]✓[/green] Bridge ready\n")
+        console.print(f"[green]{_CHECK}[/green] Bridge ready\n")
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Build failed: {e}[/red]")
         if e.stderr:
@@ -662,7 +697,7 @@ def channels_login():
     config = load_config()
     bridge_dir = _get_bridge_dir()
     
-    console.print(f"{__logo__} Starting bridge...")
+    console.print(f"{_LOGO} Starting bridge...")
     console.print("Scan the QR code to connect.\n")
     
     env = {**os.environ}
@@ -773,7 +808,7 @@ def cron_add(
         channel=channel,
     )
     
-    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+    console.print(f"[green]{_CHECK}[/green] Added job '{job.name}' ({job.id})")
 
 
 @cron_app.command("remove")
@@ -788,7 +823,7 @@ def cron_remove(
     service = CronService(store_path)
     
     if service.remove_job(job_id):
-        console.print(f"[green]✓[/green] Removed job {job_id}")
+        console.print(f"[green]{_CHECK}[/green] Removed job {job_id}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
 
@@ -808,7 +843,7 @@ def cron_enable(
     job = service.enable_job(job_id, enabled=not disable)
     if job:
         status = "disabled" if disable else "enabled"
-        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+        console.print(f"[green]{_CHECK}[/green] Job '{job.name}' {status}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
 
@@ -829,7 +864,7 @@ def cron_run(
         return await service.run_job(job_id, force=force)
     
     if asyncio.run(run()):
-        console.print(f"[green]✓[/green] Job executed")
+        console.print(f"[green]{_CHECK}[/green] Job executed")
     else:
         console.print(f"[red]Failed to run job {job_id}[/red]")
 
@@ -848,10 +883,16 @@ def status():
     config = load_config()
     workspace = config.workspace_path
 
-    console.print(f"{__logo__} nanobot Status\n")
+    console.print(f"{_LOGO} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    console.print(
+        f"Config: {config_path} "
+        f"{'[green]' + _CHECK + '[/green]' if config_path.exists() else '[red]' + _CROSS + '[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} "
+        f"{'[green]' + _CHECK + '[/green]' if workspace.exists() else '[red]' + _CROSS + '[/red]'}"
+    )
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -866,12 +907,15 @@ def status():
             if spec.is_local:
                 # Local deployments show api_base instead of api_key
                 if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
+                    console.print(f"{spec.label}: [green]{_CHECK} {p.api_base}[/green]")
                 else:
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+                console.print(
+                    f"{spec.label}: "
+                    f"{'[green]' + _CHECK + '[/green]' if has_key else '[dim]not set[/dim]'}"
+                )
 
 
 if __name__ == "__main__":

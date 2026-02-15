@@ -57,6 +57,8 @@ class CronService:
         self._store: CronStore | None = None
         self._timer_task: asyncio.Task | None = None
         self._running = False
+        self._store_persistence_available = True
+        self._save_warned = False
     
     def _load_store(self) -> CronStore:
         """Load jobs from disk."""
@@ -109,8 +111,16 @@ class CronService:
         """Save jobs to disk."""
         if not self._store:
             return
-        
-        self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._store_persistence_available:
+            return
+        try:
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self._store_persistence_available = False
+            if not self._save_warned:
+                logger.warning(f"Cron store disabled (mkdir failed): {e}")
+                self._save_warned = True
+            return
         
         data = {
             "version": self._store.version,
@@ -147,7 +157,13 @@ class CronService:
             ]
         }
         
-        self.store_path.write_text(json.dumps(data, indent=2))
+        try:
+            self.store_path.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            self._store_persistence_available = False
+            if not self._save_warned:
+                logger.warning(f"Cron store disabled (write failed): {e}")
+                self._save_warned = True
     
     async def start(self) -> None:
         """Start the cron service."""

@@ -1,0 +1,40 @@
+{
+  "providers": {
+    "openrouter": {
+      "apiKey": "sk-or-v1-your_api_key"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "~/.nanobot/workspace",
+      "model": "anthropic/claude-opus-4-5"
+    }
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "cli_xxx",
+      "appSecret": "xxx",
+      "encryptKey": "",
+      "verificationToken": "",
+      "allowFrom": []
+    }
+  },
+  "codex": {
+    "enabled": true,
+    "commandPrefix": "/cx",
+    "codexPath": "codex",
+    "model": "gpt-5.3-codex",
+    "sandbox": "danger-full-access",
+    "approvalPolicy": "never",
+    "reasoningMode": "xhigh",
+    "useTempWorkspace": true,
+    "tempWorkspaceRoot": "",
+    "stream": {
+      "enabled": true,
+      "minIntervalSeconds": 12,
+      "maxLines": 30,
+      "maxChars": 1200
+    }
+  }
+}
