@@ -429,8 +429,12 @@ class AgentLoop:
                 "- `/cx apply [task_id] [-- [codex args]]`",
                 "- `/cx list`",
                 "- `/cx sessions [n]`",
+                "- `/cx diff [run_name|session_id|path]`",
                 "- `/cx tail <name> [lines]`",
                 "- `/cx stop <name>`",
+                "- `/cx pending`",
+                "- `/cx approve <name>`",
+                "- `/cx reject <name>`",
                 "- `/cx stream on|off`",
                 "- `/cx bind` / `/cx unbind`",
                 "- `/cx id`",
@@ -545,6 +549,10 @@ class AgentLoop:
                     limit = int(args[0])
                 return self.codex.list_sessions_text(limit=limit)
 
+            if sub == "diff":
+                target = args[0] if args else None
+                return self.codex.diff_files_text(target=target)
+
             if sub == "tail":
                 if not args:
                     return "Usage: /cx tail [name] [lines]"
@@ -557,6 +565,19 @@ class AgentLoop:
                 if not args:
                     return "Usage: /cx stop [name]"
                 return self.codex.stop_run(args[0])
+
+            if sub == "pending":
+                return self.codex.list_pending_text()
+
+            if sub == "approve":
+                if not args:
+                    return "Usage: /cx approve [name]"
+                return self.codex.submit_approval(args[0], approved=True)
+
+            if sub == "reject":
+                if not args:
+                    return "Usage: /cx reject [name]"
+                return self.codex.submit_approval(args[0], approved=False)
 
             if sub == "stream":
                 if not args:

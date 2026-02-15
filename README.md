@@ -265,8 +265,12 @@ cp config.example.json ~/.nanobot/config.json
 - `/cx apply <task_id> [-- <codex args>]`
 - `/cx list`
 - `/cx sessions [n]`
+- `/cx diff [run_name|session_id|path]`
 - `/cx tail <name> [lines]`
 - `/cx stop <name>`
+- `/cx pending`
+- `/cx approve <name>`
+- `/cx reject <name>`
 - `/cx stream on|off`
 - `/cx bind` (bind current chat as codex notify target)
 - `/cx unbind` (clear notify target)
@@ -277,6 +281,8 @@ Behavior notes:
 - Local Codex sessions on the same machine are monitored; when a session completes, its final answer can be pushed to the bound chat target.
 - `/cx resume [session_id]` will use that session's original workspace (`cwd`) automatically.
 - `/cx run` uses a temporary workspace directory by default (under `<workspace>/.codex-temp-workspaces`).
+- `/cx diff` shows changed files using `git status --short` in the target workspace.
+- To use in-chat approval (`/cx pending`, `/cx approve`, `/cx reject`), set `codex.approvalPolicy` to `on-request` or `untrusted`.
 
 <details>
 <summary><b>Mochat (Claw IM)</b></summary>

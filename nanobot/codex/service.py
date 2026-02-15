@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -44,6 +45,9 @@ class CodexRun:
     last_error_text: str = ""
     is_json: bool = False
     session_id: str | None = None
+    awaiting_approval: bool = False
+    approval_prompt: str = ""
+    approval_requested_at: str | None = None
 
 
 class CodexService:
@@ -242,6 +246,90 @@ class CodexService:
             lines.append(f"{s.get('id')} | {s.get('timestamp')} | {s.get('cwd')}")
         return "\n".join(lines)
 
+    def diff_files_text(self, target: str | None = None) -> str:
+        label, cwd = self._resolve_diff_target(target)
+        if not cwd:
+            return "No target workspace found. Try `/cx list` or `/cx sessions 5` first."
+        workspace = str(Path(cwd).expanduser())
+        status = self._git_status_short(workspace)
+        if status is None:
+            return "\n".join([
+                "### Diff Files",
+                "",
+                f"- Target: `{label}`",
+                f"- Workspace: `{workspace}`",
+                "",
+                "No git repository found in this workspace.",
+            ])
+        lines = [ln for ln in status.splitlines() if ln.strip()]
+        if not lines:
+            return "\n".join([
+                "### Diff Files",
+                "",
+                f"- Target: `{label}`",
+                f"- Workspace: `{workspace}`",
+                "",
+                "No changed files.",
+            ])
+        max_items = 200
+        shown = lines[:max_items]
+        body = "\n".join(shown)
+        more = ""
+        if len(lines) > max_items:
+            more = f"\n... ({len(lines) - max_items} more)"
+        return (
+            f"### Diff Files\n\n"
+            f"- Target: `{label}`\n"
+            f"- Workspace: `{workspace}`\n\n"
+            f"```text\n{body}{more}\n```"
+        )
+
+    def list_pending_text(self) -> str:
+        pending = [
+            r for r in self._runs.values()
+            if r.status == "running" and r.awaiting_approval
+        ]
+        if not pending:
+            return "No pending approvals."
+        pending = sorted(pending, key=lambda r: r.started_at, reverse=True)
+        lines = ["### Pending Approvals", ""]
+        for r in pending:
+            prompt = self._trim_output(r.approval_prompt or "")
+            lines.extend([
+                f"- Run: `{r.name}` (`{r.run_id}`)",
+                f"- Workspace: `{r.cwd}`",
+                f"- Prompt: {prompt or '(empty)'}",
+                f"- Actions:",
+                f"/cx approve {r.name}",
+                f"/cx reject {r.name}",
+                "",
+            ])
+        return "\n".join(lines).rstrip()
+
+    def submit_approval(self, name_or_id: str, approved: bool) -> str:
+        run = self.get_run(name_or_id)
+        if not run:
+            return "Run not found."
+        if run.status != "running":
+            return f"Run {run.name} is not running."
+        if not run.awaiting_approval:
+            return f"Run {run.name} has no pending approval request."
+        proc = self._get_proc(run.run_id)
+        if not proc or not proc.stdin:
+            return f"Run {run.name} cannot accept approval input right now."
+        token = "y\n" if approved else "n\n"
+        try:
+            proc.stdin.write(token)
+            proc.stdin.flush()
+        except Exception as e:
+            return f"Failed to send approval decision: {e}"
+        run.awaiting_approval = False
+        run.approval_prompt = ""
+        run.approval_requested_at = None
+        self._save_state()
+        action = "approved" if approved else "rejected"
+        return f"Sent {action} decision to `{run.name}`."
+
     def set_stream_enabled(self, enabled: bool) -> None:
         self.config.stream.enabled = enabled
 
@@ -361,6 +449,7 @@ class CodexService:
         proc = subprocess.Popen(
             cmd,
             cwd=run.cwd,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -393,6 +482,7 @@ class CodexService:
             exit_code = proc.wait()
             run.exit_code = exit_code
             run.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            run.awaiting_approval = False
             if run.status == "running":
                 run.status = "finished" if exit_code == 0 else "failed"
             if run.stream_pending and self.config.stream.enabled:
@@ -435,28 +525,34 @@ class CodexService:
                 )
 
     def _handle_line(self, run: CodexRun, line: str) -> None:
+        raw = (line or "").strip()
+        if not raw:
+            return
         text = None
         answer = None
+        approval_prompt = None
         if run.is_json:
             try:
-                obj = json.loads(line)
+                obj = json.loads(raw)
                 sid = self._extract_session_id(obj)
                 if sid:
                     run.session_id = sid
-                    self._owned_session_ids.add(sid)
+                    self._mark_owned_session_id(sid)
                 text = self._extract_text(obj)
                 answer = self._extract_answer(obj)
                 if answer:
                     run.last_answer = answer
+                approval_prompt = self._extract_approval_prompt(obj)
             except Exception:
-                plain = (line or "").strip()
-                if plain:
-                    run.last_error_text = plain
+                run.last_error_text = raw
                 text = None
         else:
-            text = (line or "").strip()
-            if text:
-                run.last_error_text = text
+            text = raw
+            run.last_error_text = text
+        if not approval_prompt:
+            approval_prompt = self._extract_approval_prompt_from_text(raw)
+        if approval_prompt:
+            self._set_pending_approval(run, approval_prompt)
         if not text:
             return
         if not self.config.stream.enabled or not self._loop:
@@ -659,6 +755,105 @@ class CodexService:
             return payload.get("session_id")
         return None
 
+    @staticmethod
+    def _extract_approval_prompt_from_text(text: str) -> str | None:
+        t = (text or "").strip()
+        if not t:
+            return None
+        low = t.lower()
+        has_approval_word = any(k in low for k in ("approve", "approval", "permission", "allow this"))
+        has_choice_word = any(k in low for k in ("y/n", "yes/no", "(y/n)", "[y/n]"))
+        if has_approval_word and has_choice_word:
+            return t
+        if re.search(r"\bapprove\b.*\?", low):
+            return t
+        return None
+
+    @classmethod
+    def _extract_approval_prompt(cls, obj: dict[str, Any]) -> str | None:
+        typ = str(obj.get("type") or "").lower()
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        ptype = str(payload.get("type") or "").lower()
+        if "approval" in typ or "approval" in ptype:
+            return cls._extract_first_text(obj) or f"Approval requested ({typ or ptype})"
+        if cls._json_has_approval_flag(obj):
+            return cls._extract_first_text(obj) or "Approval required by codex."
+        return None
+
+    @classmethod
+    def _json_has_approval_flag(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                lk = str(k).lower()
+                if "approval" in lk or "approve" in lk:
+                    if isinstance(v, bool) and v:
+                        return True
+                    if isinstance(v, str) and v.strip():
+                        return True
+                if cls._json_has_approval_flag(v):
+                    return True
+            return False
+        if isinstance(value, list):
+            return any(cls._json_has_approval_flag(v) for v in value)
+        return False
+
+    @classmethod
+    def _extract_first_text(cls, value: Any) -> str | None:
+        if isinstance(value, dict):
+            for key in ("message", "text", "prompt", "reason", "description"):
+                v = value.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            for v in value.values():
+                found = cls._extract_first_text(v)
+                if found:
+                    return found
+            return None
+        if isinstance(value, list):
+            for item in value:
+                found = cls._extract_first_text(item)
+                if found:
+                    return found
+            return None
+        return None
+
+    def _set_pending_approval(self, run: CodexRun, prompt: str) -> None:
+        prompt_clean = self._trim_output(prompt or "") or "Approval required by codex."
+        if run.awaiting_approval and run.approval_prompt == prompt_clean:
+            return
+        run.awaiting_approval = True
+        run.approval_prompt = prompt_clean
+        run.approval_requested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._save_state()
+        message = (
+            f"### Approval Required\n\n"
+            f"- Run: `{run.name}`\n"
+            f"- Workspace: `{run.cwd}`\n\n"
+            f"**Request**\n{prompt_clean}\n\n"
+            f"**Actions**\n"
+            f"/cx approve {run.name}\n"
+            f"/cx reject {run.name}\n"
+            f"/cx pending"
+        )
+        self._notify(run, message, fmt="markdown")
+
+    @staticmethod
+    def _session_id_variants(session_id: str) -> set[str]:
+        sid = (session_id or "").strip()
+        if not sid:
+            return set()
+        return {
+            sid,
+            sid.replace("-", "_"),
+            sid.replace("_", "-"),
+        }
+
+    def _mark_owned_session_id(self, session_id: str | None) -> None:
+        if not session_id:
+            return
+        for sid in self._session_id_variants(session_id):
+            self._owned_session_ids.add(sid)
+
     def _list_codex_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
         base = Path.home() / ".codex" / "sessions"
         if not base.exists():
@@ -687,6 +882,45 @@ class CodexService:
         if recent and recent[0].get("cwd"):
             return str(recent[0]["cwd"])
         return None
+
+    def _resolve_diff_target(self, target: str | None) -> tuple[str, str | None]:
+        raw = (target or "").strip()
+        if raw:
+            if run := self.get_run(raw):
+                return (f"run:{run.name}", run.cwd)
+            if meta := self._find_session_meta(raw):
+                cwd = meta.get("cwd")
+                return (f"session:{raw}", str(cwd) if cwd else None)
+            direct = str(Path(raw).expanduser())
+            return (f"path:{raw}", direct)
+
+        runs = sorted(self._runs.values(), key=lambda r: r.started_at, reverse=True)
+        if runs:
+            return (f"run:{runs[0].name}", runs[0].cwd)
+        recent = self._list_codex_sessions(limit=1)
+        if recent:
+            sid = recent[0].get("id") or "latest"
+            cwd = recent[0].get("cwd")
+            return (f"session:{sid}", str(cwd) if cwd else None)
+        return ("latest", None)
+
+    @staticmethod
+    def _git_status_short(workspace: str) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", workspace, "status", "--short"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+        except Exception:
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip()
 
     def _find_session_meta(self, session_id: str) -> dict[str, Any] | None:
         base = Path.home() / ".codex" / "sessions"
@@ -795,7 +1029,16 @@ class CodexService:
             return
         if not sid:
             return
-        if sid in self._owned_session_ids:
+        meta = self._find_external_meta(sid)
+        if not meta:
+            # Fallback: read session meta from the same rollout file.
+            if file_meta := self._read_session_meta(path):
+                meta = file_meta
+                if file_meta.get("id"):
+                    self._external_meta[file_meta["id"]] = file_meta
+        cwd = (meta or {}).get("cwd")
+        if self._is_owned_or_recent_local(sid, cwd):
+            logger.info(f"Skip external duplicate codex turn: session={sid}, cwd={cwd or 'N/A'}")
             return
         event_key = f"{sid}:{payload.get('turn_id') or obj.get('timestamp') or ''}"
         if event_key in self._external_seen:
@@ -806,8 +1049,7 @@ class CodexService:
             return
         channel, chat_id = route
         last_msg = (payload.get("last_agent_message") or "").strip()
-        meta = self._external_meta.get(sid) or {}
-        cwd = meta.get("cwd") or "N/A"
+        cwd = cwd or "N/A"
         if last_msg:
             answer_msg = (
                 f"{last_msg}\n\n"
@@ -831,13 +1073,66 @@ class CodexService:
     def _extract_session_id_from_path(path: Path) -> str | None:
         name = path.stem
         # rollout-2026-02-15T19-00-11-<session_id>
-        marker = "rollout-"
-        if not name.startswith(marker):
+        m = re.match(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)$", name)
+        if m:
+            return m.group(1).strip() or None
+        if not name.startswith("rollout-"):
             return None
-        parts = name.split("-")
+        # Fallback parser: keep everything after timestamp as session id.
+        parts = name.split("-", 6)
         if len(parts) < 7:
             return None
-        return "-".join(parts[-5:])
+        sid = parts[6].strip()
+        return sid or None
+
+    def _find_external_meta(self, session_id: str | None) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        for sid in self._session_id_variants(session_id):
+            if sid in self._external_meta:
+                return self._external_meta[sid]
+        return None
+
+    @staticmethod
+    def _normalize_path(path: str | None) -> str:
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.normpath(str(Path(path).expanduser())))
+        except Exception:
+            return os.path.normcase(os.path.normpath(str(path)))
+
+    @staticmethod
+    def _is_run_recent(run: CodexRun, seconds: int = 1800) -> bool:
+        if run.status == "running":
+            return True
+        ts = run.finished_at or run.started_at
+        if not ts:
+            return False
+        try:
+            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return False
+        return (datetime.now() - dt).total_seconds() <= seconds
+
+    def _is_owned_or_recent_local(self, session_id: str | None, cwd: str | None) -> bool:
+        if session_id:
+            variants = self._session_id_variants(session_id)
+            if any(v in self._owned_session_ids for v in variants):
+                return True
+            for run in self._runs.values():
+                if not run.session_id:
+                    continue
+                if variants & self._session_id_variants(run.session_id):
+                    return True
+        norm_cwd = self._normalize_path(cwd)
+        if norm_cwd:
+            for run in self._runs.values():
+                if not self._is_run_recent(run):
+                    continue
+                if self._normalize_path(run.cwd) == norm_cwd:
+                    return True
+        return False
 
     def _get_notify_route(self) -> tuple[str, str] | None:
         if self._default_notify_route:
@@ -923,9 +1218,13 @@ class CodexService:
                     chat_id=item.get("chat_id", ""),
                     session_id=item.get("session_id"),
                     is_json=item.get("is_json", False),
+                    awaiting_approval=item.get("awaiting_approval", False),
+                    approval_prompt=item.get("approval_prompt", ""),
+                    approval_requested_at=item.get("approval_requested_at"),
                 )
                 if run.run_id:
                     self._runs[run.run_id] = run
+                    self._mark_owned_session_id(run.session_id)
         except Exception:
             return
 
@@ -947,6 +1246,9 @@ class CodexService:
                 "chat_id": r.chat_id,
                 "session_id": r.session_id,
                 "is_json": r.is_json,
+                "awaiting_approval": r.awaiting_approval,
+                "approval_prompt": r.approval_prompt,
+                "approval_requested_at": r.approval_requested_at,
             })
         try:
             self._state_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
