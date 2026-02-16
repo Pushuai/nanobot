@@ -30,6 +30,10 @@ try:
         P2ImMessageReactionDeletedV1,
         P2ImMessageMessageReadV1,
     )
+    from lark_oapi.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTrigger,
+        P2CardActionTriggerResponse,
+    )
     FEISHU_AVAILABLE = True
 except ImportError:
     FEISHU_AVAILABLE = False
@@ -141,6 +145,8 @@ class FeishuChannel(BaseChannel):
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
+        ).register_p2_card_action_trigger(
+            self._on_card_action_sync
         ).register_p2_im_chat_access_event_bot_p2p_chat_entered_v1(
             self._on_chat_entered_sync
         ).register_p2_im_message_reaction_created_v1(
@@ -298,6 +304,28 @@ class FeishuChannel(BaseChannel):
 
         return elements or [{"tag": "markdown", "content": content}]
 
+    @staticmethod
+    def _flatten_form_text(value: Any) -> str:
+        """Best-effort flatten Feishu card form values into a plain string."""
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, dict):
+            for key in ("value", "text", "input", "content"):
+                if key in value:
+                    got = FeishuChannel._flatten_form_text(value.get(key))
+                    if got:
+                        return got
+            parts = [FeishuChannel._flatten_form_text(v) for v in value.values()]
+            return " ".join([p for p in parts if p]).strip()
+        if isinstance(value, list):
+            parts = [FeishuChannel._flatten_form_text(v) for v in value]
+            return " ".join([p for p in parts if p]).strip()
+        return ""
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu."""
         if not self._client:
@@ -329,7 +357,27 @@ class FeishuChannel(BaseChannel):
             else:
                 receive_id_type = "open_id"
 
+            custom_card = (msg.metadata or {}).get("feishu_interactive_card")
             fmt = (msg.metadata or {}).get("format")
+            if custom_card:
+                content = json.dumps(custom_card, ensure_ascii=False)
+                request = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(msg.chat_id)
+                        .msg_type("interactive")
+                        .content(content)
+                        .build()
+                    ).build()
+                response = self._client.im.v1.message.create(request)
+                if not response.success():
+                    logger.error(
+                        f"Failed to send Feishu interactive card: code={response.code}, "
+                        f"msg={response.msg}, log_id={response.get_log_id()}"
+                    )
+                return
+
             if fmt == "text":
                 content = json.dumps({"text": msg.content}, ensure_ascii=False)
                 request = CreateMessageRequest.builder() \
@@ -412,6 +460,81 @@ class FeishuChannel(BaseChannel):
     def _on_message_read_sync(self, data: "P2ImMessageMessageReadV1") -> None:
         """Sync handler for message read (no-op)."""
         logger.info("Feishu event: message_read")
+
+    def _on_card_action_sync(self, data: "P2CardActionTrigger") -> "P2CardActionTriggerResponse":
+        """Sync handler for Feishu interactive card actions."""
+        try:
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._on_card_action(data), self._loop)
+        except Exception as e:
+            logger.warning(f"Feishu card action dispatch failed: {e}")
+        return P2CardActionTriggerResponse({
+            "toast": {"type": "info", "content": "Received. Processing..."},
+        })
+
+    async def _on_card_action(self, data: "P2CardActionTrigger") -> None:
+        """Handle Feishu interactive card button clicks and convert them to bot commands."""
+        try:
+            event = getattr(data, "event", None)
+            if not event:
+                return
+            action = getattr(event, "action", None)
+            value = getattr(action, "value", None) if action else None
+            if not isinstance(value, dict):
+                return
+            cmd = (value.get("nanobot_cmd") or "").strip()
+            action_name = (value.get("nanobot_action") or "").strip()
+            if not cmd and action_name == "cx_quick_continue":
+                sid = (value.get("session_id") or "").strip()
+                form_value = getattr(action, "form_value", None) if action else None
+                prompt = ""
+                if isinstance(form_value, dict):
+                    # Some Feishu payloads are flat: {"resume_prompt": "..."}
+                    prompt = self._flatten_form_text(form_value.get("resume_prompt")).strip()
+                    # Some are nested by form name: {"resume_form": {"resume_prompt": "..."}}
+                    if not prompt:
+                        nested = form_value.get("resume_form")
+                        if isinstance(nested, dict):
+                            prompt = self._flatten_form_text(nested.get("resume_prompt")).strip()
+                    # Fallback: flatten all keys for compatibility.
+                    if not prompt:
+                        prompt = self._flatten_form_text(form_value).strip()
+                if not prompt:
+                    prompt = self._flatten_form_text(getattr(action, "input_value", None)).strip()
+                if sid:
+                    cmd = f"/cx resume {sid}"
+                    if prompt:
+                        cmd += f" {prompt}"
+                else:
+                    cmd = "/cx sessions 5"
+            if not cmd:
+                return
+
+            operator = getattr(event, "operator", None)
+            sender_id = (
+                (getattr(operator, "open_id", None) or "")
+                or (getattr(operator, "user_id", None) or "")
+                or "unknown"
+            )
+            context = getattr(event, "context", None)
+            chat_id = (
+                (getattr(context, "open_chat_id", None) or "")
+                or sender_id
+            )
+
+            logger.info(f"Feishu card action: sender={sender_id} chat_id={chat_id} cmd={cmd}")
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=cmd,
+                metadata={
+                    "source": "feishu_card_action",
+                    "card_action": value,
+                    "message_id": getattr(context, "open_message_id", None) if context else None,
+                },
+            )
+        except Exception as e:
+            logger.error(f"Error processing Feishu card action: {e}")
     
     async def _on_message(self, data: "P2ImMessageReceiveV1") -> None:
         """Handle incoming message from Feishu."""

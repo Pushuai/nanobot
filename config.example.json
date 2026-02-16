@@ -36,5 +36,19 @@
       "maxLines": 30,
       "maxChars": 1200
     }
+  },
+  "tools": {
+    "exec": {
+      "directEnabled": true,
+      "directPrefix": "/exec",
+      "directAllowPatterns": [".*"],
+      "approvalEnabled": true,
+      "approvalModelEnabled": true,
+      "approvalModel": "",
+      "approvalModelMinLevel": "medium",
+      "approvalModelMaxTokens": 200,
+      "approvalModelTemperature": 0.0,
+      "approvalModelRequireOnError": false
+    }
   }
 }

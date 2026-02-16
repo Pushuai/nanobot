@@ -260,6 +260,7 @@ cp config.example.json ~/.nanobot/config.json
 - `/cx help`
 - `/cx run <prompt> [-- <codex args>]`
 - `/cx run -n <name> <prompt> [-- <codex args>]`
+- `/cx run --cwd <path> <prompt> [-- <codex args>]`
 - `/cx review [prompt] [-- <codex args>]`
 - `/cx resume <session_id> [prompt] [-- <codex args>]`
 - `/cx apply <task_id> [-- <codex args>]`
@@ -278,11 +279,49 @@ cp config.example.json ~/.nanobot/config.json
 Behavior notes:
 - Codex replies are sent back as conversational messages (final answer first; not only status lines).
 - Codex notifications are sent as Markdown cards and include workspace/session context.
+- On Feishu, `Quick Continue` is sent as an interactive card with a prompt input box and action buttons.
 - Local Codex sessions on the same machine are monitored; when a session completes, its final answer can be pushed to the bound chat target.
 - `/cx resume [session_id]` will use that session's original workspace (`cwd`) automatically.
 - `/cx run` uses a temporary workspace directory by default (under `<workspace>/.codex-temp-workspaces`).
+- Use `/cx run --cwd <path> ...` to run in a specific workspace directory.
 - `/cx diff` shows changed files using `git status --short` in the target workspace.
 - To use in-chat approval (`/cx pending`, `/cx approve`, `/cx reject`), set `codex.approvalPolicy` to `on-request` or `untrusted`.
+- On Feishu, codex approval messages support interactive card buttons (Approve / Reject / Pending).
+
+## Shell Command Approval
+
+For risky shell commands (write/modify operations), nanobot can require approval before execution.
+It now supports **regex + model** combined risk checks:
+- Regex: deterministic hard rules for known risky patterns.
+- Model: semantic risk classification to catch regex misses.
+
+Config example (`~/.nanobot/config.json`):
+
+```json
+{
+  "tools": {
+    "exec": {
+      "directEnabled": true,
+      "directPrefix": "/exec",
+      "directAllowPatterns": [".*"],
+      "approvalEnabled": true,
+      "approvalModelEnabled": true,
+      "approvalModel": "",
+      "approvalModelMinLevel": "medium",
+      "approvalModelMaxTokens": 200,
+      "approvalModelTemperature": 0.0,
+      "approvalModelRequireOnError": false
+    }
+  }
+}
+```
+
+Approval commands:
+- `/exec pending`
+- `/exec approve <request_id>`
+- `/exec reject <request_id>`
+
+On Feishu, shell approval requests are sent as interactive cards with action buttons.
 
 <details>
 <summary><b>Mochat (Claw IM)</b></summary>

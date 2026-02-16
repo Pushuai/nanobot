@@ -110,6 +110,10 @@ class AgentLoop:
             timeout=self.exec_config.timeout,
             deny_patterns=deny_patterns,
             allow_patterns=allow_patterns,
+            approval_enabled=self.exec_config.approval_enabled,
+            approval_risk_patterns=self.exec_config.approval_risk_patterns or None,
+            risk_assessor=self._assess_exec_risk if self.exec_config.approval_model_enabled else None,
+            approval_callback=self._send_exec_approval_request,
             restrict_to_workspace=self.restrict_to_workspace,
         ))
         
@@ -139,7 +143,78 @@ class AgentLoop:
         await self._mcp_stack.__aenter__()
         await connect_mcp_servers(self._mcp_servers, self.tools, self._mcp_stack)
 
-    def _set_tool_context(self, channel: str, chat_id: str) -> None:
+    async def _send_exec_approval_request(self, req: dict[str, Any]) -> None:
+        """Publish an exec approval request to the original chat."""
+        channel = req.get("channel") or "cli"
+        chat_id = req.get("chat_id") or "direct"
+        command = req.get("command", "")
+        request_id = req.get("id", "")
+        cwd = req.get("cwd", "")
+        risk_text = self._format_exec_risk(req.get("risk_meta"))
+        content = "\n".join([
+            "### Exec Approval Required",
+            "",
+            f"- Request: `{request_id}`",
+            f"- Workspace: `{cwd}`",
+            f"- Command: `{command}`",
+            *([f"- Risk: {risk_text}"] if risk_text else []),
+            "",
+            "**Actions**",
+            f"/exec approve {request_id}",
+            f"/exec reject {request_id}",
+            "/exec pending",
+        ])
+        metadata: dict[str, Any] = {"format": "markdown", "source": "exec_approval"}
+        if channel == "feishu":
+            metadata["feishu_interactive_card"] = {
+                "config": {"wide_screen_mode": True},
+                "header": {
+                    "title": {"tag": "plain_text", "content": "Exec 审核请求"}
+                },
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            f"**Request:** `{request_id}`\n"
+                            f"**Workspace:** `{cwd}`\n"
+                            f"**Command:** `{command}`\n"
+                            + (f"**Risk:** {risk_text}" if risk_text else "")
+                        ),
+                    },
+                    {
+                        "tag": "action",
+                        "actions": [
+                            {
+                                "tag": "button",
+                                "type": "primary",
+                                "text": {"tag": "plain_text", "content": "通过"},
+                                "value": {"nanobot_cmd": f"/exec approve {request_id}"},
+                            },
+                            {
+                                "tag": "button",
+                                "type": "danger",
+                                "text": {"tag": "plain_text", "content": "拒绝"},
+                                "value": {"nanobot_cmd": f"/exec reject {request_id}"},
+                            },
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "查看待审"},
+                                "value": {"nanobot_cmd": "/exec pending"},
+                            },
+                        ],
+                    },
+                ],
+            }
+        await self.bus.publish_outbound(
+            OutboundMessage(
+                channel=channel,
+                chat_id=chat_id,
+                content=content,
+                metadata=metadata,
+            )
+        )
+
+    def _set_tool_context(self, channel: str, chat_id: str, sender_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -152,6 +227,10 @@ class AgentLoop:
         if cron_tool := self.tools.get("cron"):
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
+
+        if exec_tool := self.tools.get("exec"):
+            if isinstance(exec_tool, ExecTool):
+                exec_tool.set_context(channel, chat_id, sender_id)
 
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
@@ -292,6 +371,9 @@ class AgentLoop:
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
         
+        # Update tool routing context as early as possible (also needed by direct commands)
+        self._set_tool_context(msg.channel, msg.chat_id, msg.sender_id)
+
         # Handle slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
@@ -320,7 +402,6 @@ class AgentLoop:
         if len(session.messages) > self.memory_window:
             asyncio.create_task(self._consolidate_memory(session))
 
-        self._set_tool_context(msg.channel, msg.chat_id)
         initial_messages = self.context.build_messages(
             history=session.get_history(max_messages=self.memory_window),
             current_message=msg.content,
@@ -377,13 +458,61 @@ class AgentLoop:
 
         # Direct exec command
         exec_prefix = (self.exec_config.direct_prefix or "/exec").strip()
-        if self.exec_config.direct_enabled and exec_prefix and content.startswith(exec_prefix):
+        if exec_prefix and content.startswith(exec_prefix):
             command = content[len(exec_prefix):].strip()
             if not command:
                 return OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=f"Usage: {exec_prefix} <command>",
+                )
+            exec_tool = self.tools.get("exec")
+            if not isinstance(exec_tool, ExecTool):
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Exec tool is not available.",
+                )
+            try:
+                parts = shlex.split(command)
+            except ValueError as e:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=f"Invalid command syntax: {e}",
+                )
+            if parts:
+                sub = parts[0].lower()
+                if sub == "pending":
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=exec_tool.list_pending_text(chat_id=msg.chat_id),
+                        metadata={"format": "markdown", "source": "exec"},
+                    )
+                if sub in ("approve", "reject"):
+                    if len(parts) < 2:
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=f"Usage: {exec_prefix} {sub} <request_id>",
+                        )
+                    approved = sub == "approve"
+                    result = await exec_tool.resolve_pending(
+                        request_id=parts[1],
+                        approved=approved,
+                        actor_id=msg.sender_id,
+                    )
+                    return OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=result,
+                    )
+            if not self.exec_config.direct_enabled:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Direct exec disabled: set tools.exec.directEnabled=true.",
                 )
             allow_patterns = self.exec_config.direct_allow_patterns or []
             if not allow_patterns:
@@ -417,6 +546,7 @@ class AgentLoop:
                 "",
                 "**Common Usage**",
                 "- Run once: `/cx run [prompt]`",
+                "- Run in directory: `/cx run --cwd [path] [prompt]`",
                 "- Continue session: `/cx resume [session_id] [prompt]`",
                 "- List sessions: `/cx sessions 10`",
                 "- Tail logs: `/cx tail [run_name] 80`",
@@ -424,6 +554,7 @@ class AgentLoop:
                 "**Command List**",
                 "- `/cx run [prompt] [-- [codex args]]`",
                 "- `/cx run -n [name] [prompt] [-- [codex args]]`",
+                "- `/cx run --cwd [path] [prompt] [-- [codex args]]`",
                 "- `/cx review [prompt] [-- [codex args]]`",
                 "- `/cx resume [session_id] [prompt] [-- [codex args]]`",
                 "- `/cx apply [task_id] [-- [codex args]]`",
@@ -455,17 +586,35 @@ class AgentLoop:
         try:
             if sub in ("run", "exec"):
                 name = None
-                if len(args) >= 2 and args[0] in ("-n", "--name"):
-                    name = args[1]
-                    args = args[2:]
-                prompt = " ".join(args).strip()
+                run_cwd = None
+                consumed: list[str] = []
+                i = 0
+                while i < len(args):
+                    token = args[i]
+                    if token in ("-n", "--name"):
+                        if i + 1 >= len(args):
+                            return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
+                        name = args[i + 1]
+                        i += 2
+                        continue
+                    if token in ("-C", "--cwd", "--workdir"):
+                        if i + 1 >= len(args):
+                            return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
+                        run_cwd = args[i + 1]
+                        i += 2
+                        continue
+                    consumed.append(token)
+                    i += 1
+
+                prompt = " ".join(consumed).strip()
                 if not prompt:
-                    return "Usage: /cx run [prompt] [-- [codex args]]"
+                    return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
                 run = self.codex.run_exec(
                     prompt=prompt,
                     name=name,
                     channel=msg.channel,
                     chat_id=msg.chat_id,
+                    work_dir=run_cwd,
                     extra_args=extra_args,
                 )
                 return "\n".join([
@@ -600,6 +749,127 @@ class AgentLoop:
             return "Unknown command. Send '/cx' to view help."
         except Exception as e:
             return f"Codex error: {e}"
+
+    async def _assess_exec_risk(self, command: str, cwd: str) -> dict[str, Any] | None:
+        """Optional model-assisted risk assessment for shell commands."""
+        if not self.exec_config.approval_model_enabled:
+            return None
+
+        model_name = (self.exec_config.approval_model or self.model).strip() or self.model
+        min_level = self._normalize_risk_level(self.exec_config.approval_model_min_level)
+        max_tokens = max(64, int(self.exec_config.approval_model_max_tokens or 200))
+        temperature = float(self.exec_config.approval_model_temperature)
+
+        prompt = (
+            "You are a shell command risk classifier.\n"
+            "Classify the command risk level for potential data modification/destruction/"
+            "security impact.\n"
+            "Return ONLY JSON with keys: level, reason.\n"
+            "level must be one of: low, medium, high.\n"
+            "Guidance:\n"
+            "- Read-only commands (ls/cat/pwd/git status/git log) => low\n"
+            "- File writes, installs, config changes => medium or high\n"
+            "- Destructive/irreversible/system-impacting commands => high"
+        )
+        user_payload = json.dumps(
+            {"command": command, "working_dir": cwd},
+            ensure_ascii=False,
+        )
+
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_payload},
+                ],
+                tools=None,
+                model=model_name,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            raw = (response.content or "").strip()
+            parsed = self._extract_first_json_object(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("risk model did not return valid JSON object")
+            level = self._normalize_risk_level(parsed.get("level") or parsed.get("risk"))
+            reason = str(parsed.get("reason") or "").strip()
+            require = self._risk_level_score(level) >= self._risk_level_score(min_level)
+            return {
+                "source": "model",
+                "level": level,
+                "reason": reason or "model classified command risk",
+                "require_approval": require,
+            }
+        except Exception as e:
+            require = bool(self.exec_config.approval_model_require_on_error)
+            return {
+                "source": "model",
+                "level": "unknown",
+                "reason": f"model risk check failed: {e}",
+                "require_approval": require,
+            }
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+        if not text:
+            return None
+        raw = text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            maybe = raw[start : end + 1]
+            try:
+                obj = json.loads(maybe)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _normalize_risk_level(level: Any) -> str:
+        lv = str(level or "").strip().lower()
+        if lv in {"low", "medium", "high"}:
+            return lv
+        if lv in {"med", "moderate"}:
+            return "medium"
+        if lv in {"critical", "severe"}:
+            return "high"
+        if lv in {"safe", "readonly", "read-only"}:
+            return "low"
+        return "unknown"
+
+    @staticmethod
+    def _risk_level_score(level: str) -> int:
+        return {"low": 1, "medium": 2, "high": 3, "unknown": 0}.get(level, 0)
+
+    @staticmethod
+    def _format_exec_risk(meta: Any) -> str:
+        if not isinstance(meta, dict):
+            return ""
+        chunks: list[str] = []
+        if meta.get("regex_hit"):
+            chunks.append("regex 命中")
+        model = meta.get("model")
+        if isinstance(model, dict):
+            level = str(model.get("level") or "").strip()
+            reason = str(model.get("reason") or "").strip()
+            if level:
+                if reason:
+                    if len(reason) > 120:
+                        reason = reason[:120] + "..."
+                    chunks.append(f"model={level} ({reason})")
+                else:
+                    chunks.append(f"model={level}")
+        return "; ".join(chunks)
 
     @staticmethod
     def _match_any_pattern(text: str, patterns: list[str]) -> bool:

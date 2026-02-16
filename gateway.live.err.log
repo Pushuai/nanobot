@@ -1,0 +1,9 @@
+2026-02-16 10:37:30.413 | INFO     | nanobot.channels.manager:_init_channels:79 - Feishu channel enabled
+2026-02-16 10:37:30.437 | INFO     | nanobot.cron.service:start:175 - Cron service started with 0 jobs
+2026-02-16 10:37:30.437 | INFO     | nanobot.heartbeat.service:start:81 - Heartbeat started (every 1800s)
+2026-02-16 10:37:30.437 | INFO     | nanobot.agent.loop:run:297 - Agent loop started
+2026-02-16 10:37:30.437 | INFO     | nanobot.channels.manager:start_all:159 - Starting feishu channel...
+2026-02-16 10:37:30.437 | INFO     | nanobot.codex.service:start:89 - Codex service started
+2026-02-16 10:37:30.443 | INFO     | nanobot.channels.manager:_dispatch_outbound:187 - Outbound dispatcher started
+2026-02-16 10:37:30.444 | INFO     | nanobot.channels.feishu:start:181 - Feishu bot started with WebSocket long connection
+2026-02-16 10:37:30.444 | INFO     | nanobot.channels.feishu:start:182 - No public IP required - using WebSocket to receive events

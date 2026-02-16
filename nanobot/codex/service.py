@@ -1,8 +1,9 @@
-"""Codex CLI service for running and monitoring Codex tasks."""
+﻿"""Codex CLI service for running and monitoring Codex tasks."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -64,6 +65,7 @@ class CodexService:
         self._external_offsets: dict[str, int] = {}
         self._external_meta: dict[str, dict[str, Any]] = {}
         self._external_seen: set[str] = set()
+        self._external_approval_seen: set[str] = set()
         self._external_bootstrapped = False
         self._last_external_poll_ts = 0.0
         self._default_notify_route: tuple[str, str] | None = None
@@ -158,6 +160,7 @@ class CodexService:
         name: str | None,
         channel: str,
         chat_id: str,
+        work_dir: str | None = None,
         extra_args: list[str] | None = None,
     ) -> CodexRun:
         args = ["exec"]
@@ -170,6 +173,7 @@ class CodexService:
             chat_id=chat_id,
             extra_args=extra_args or [],
             json_output=True,
+            work_dir=work_dir,
         )
 
     def run_review(
@@ -240,10 +244,23 @@ class CodexService:
     def list_sessions_text(self, limit: int = 10) -> str:
         sessions = self._list_codex_sessions(limit)
         if not sessions:
-            return "No codex sessions found."
-        lines = []
-        for s in sessions:
-            lines.append(f"{s.get('id')} | {s.get('timestamp')} | {s.get('cwd')}")
+            return "### Codex Sessions\n\nNo codex sessions found."
+
+        def _md_cell(value: Any) -> str:
+            text = str(value or "-").replace("\n", " ").replace("|", "\\|").strip()
+            return text or "-"
+
+        lines = [
+            "### Codex Sessions",
+            "",
+            "| # | Session ID | Updated | Workspace |",
+            "|---:|---|---|---|",
+        ]
+        for i, s in enumerate(sessions, start=1):
+            sid = _md_cell(s.get("id"))
+            ts = _md_cell(s.get("timestamp"))
+            cwd = _md_cell(s.get("cwd"))
+            lines.append(f"| {i} | {sid} | {ts} | {cwd} |")
         return "\n".join(lines)
 
     def diff_files_text(self, target: str | None = None) -> str:
@@ -499,29 +516,45 @@ class CodexService:
                 reason = self._trim_output(run.last_error_text) if run.last_error_text else ""
                 if reason:
                     content = (
-                        f"### Run Failed\n\n"
-                        f"- Run: `{run.name}`\n"
-                        f"- Exit: `{exit_code}`\n\n"
-                        f"**Reason**\n```\n{reason}\n```\n\n"
+                        f"### 运行失败\n\n"
+                        f"- 任务：`{run.name}`\n"
+                        f"- 退出码：`{exit_code}`\n\n"
+                        f"**原因**\n```\n{reason}\n```\n\n"
                         f"{self._quick_actions(run)}"
                     )
                 else:
                     content = (
-                        f"### Run Failed\n\n"
-                        f"- Run: `{run.name}`\n"
-                        f"- Exit: `{exit_code}`\n\n"
+                        f"### 运行失败\n\n"
+                        f"- 任务：`{run.name}`\n"
+                        f"- 退出码：`{exit_code}`\n\n"
                         f"{self._quick_actions(run)}"
                     )
+                quick_meta = self._quick_continue_metadata(
+                    channel=run.channel,
+                    session_id=run.session_id,
+                    run_name=run.name,
+                    cwd=run.cwd,
+                    title="运行失败",
+                )
                 self._notify(
                     run,
                     content,
                     fmt="markdown",
+                    metadata=quick_meta,
                 )
             else:
+                quick_meta = self._quick_continue_metadata(
+                    channel=run.channel,
+                    session_id=run.session_id,
+                    run_name=run.name,
+                    cwd=run.cwd,
+                    title="本轮已完成",
+                )
                 self._notify(
                     run,
-                    "### Turn Finished\n\n" + self._quick_actions(run),
+                    "### 本轮已完成\n\n" + self._quick_actions(run),
                     fmt="markdown",
+                    metadata=quick_meta,
                 )
 
     def _handle_line(self, run: CodexRun, line: str) -> None:
@@ -580,21 +613,32 @@ class CodexService:
         fmt: str = "markdown",
         channel: str | None = None,
         chat_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         target_channel = channel or run.channel
         target_chat_id = chat_id or run.chat_id
         if not target_channel or not target_chat_id:
             return
-        self._notify_route(target_channel, target_chat_id, content, fmt=fmt)
+        self._notify_route(target_channel, target_chat_id, content, fmt=fmt, metadata=metadata)
 
-    def _notify_route(self, channel: str, chat_id: str, content: str, fmt: str = "markdown") -> None:
+    def _notify_route(
+        self,
+        channel: str,
+        chat_id: str,
+        content: str,
+        fmt: str = "markdown",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         if not self._loop:
             return
+        msg_metadata = {"format": fmt, "source": "codex"}
+        if metadata:
+            msg_metadata.update(metadata)
         msg = OutboundMessage(
             channel=channel,
             chat_id=chat_id,
             content=content,
-            metadata={"format": fmt, "source": "codex"},
+            metadata=msg_metadata,
         )
         asyncio.run_coroutine_threadsafe(self.bus.publish_outbound(msg), self._loop)
 
@@ -615,29 +659,115 @@ class CodexService:
         session = run.session_id or "N/A"
         return (
             f"---\n"
-            f"**Workspace:** `{run.cwd}`\n"
-            f"**Session:** `{session}`"
+            f"**\u5de5\u4f5c\u7a7a\u95f4**\uff1a`{run.cwd}`\n"
+            f"**\u4f1a\u8bdd ID**\uff1a`{session}`"
         )
 
     def _quick_actions(self, run: CodexRun) -> str:
         if run.session_id:
             commands = [
-                f"/cx resume {run.session_id} [your prompt]",
+                f"/cx resume {run.session_id} [\u63d0\u793a\u8bcd]",
                 f"/cx tail {run.name}",
             ]
         else:
             commands = [
                 "/cx sessions 5",
-                "/cx resume [session_id] [your prompt]",
+                "/cx resume [session_id] [\u63d0\u793a\u8bcd]",
                 f"/cx tail {run.name}",
             ]
         cmd_block = "\n".join(commands)
         return (
             f"{self._context_footer(run)}\n\n"
-            f"**Quick Continue**\n"
-            f"Copy and send one command:\n"
+            f"**\u5feb\u901f\u7ee7\u7eed**\n"
+            f"\u590d\u5236\u5e76\u53d1\u9001\u4ee5\u4e0b\u547d\u4ee4\u4e4b\u4e00\uff1a\n"
             f"{cmd_block}"
         )
+
+    def _quick_continue_metadata(
+        self,
+        channel: str,
+        session_id: str | None,
+        run_name: str | None,
+        cwd: str | None,
+        title: str = "\u5feb\u901f\u7ee7\u7eed",
+    ) -> dict[str, Any] | None:
+        if channel != "feishu":
+            return None
+        card = self._build_quick_continue_card(
+            session_id=session_id,
+            run_name=run_name,
+            cwd=cwd,
+            title=title,
+        )
+        return {"feishu_interactive_card": card}
+
+    @staticmethod
+    def _build_quick_continue_card(
+        session_id: str | None,
+        run_name: str | None,
+        cwd: str | None,
+        title: str = "\u5feb\u901f\u7ee7\u7eed",
+    ) -> dict[str, Any]:
+        sid = (session_id or "").strip()
+        workspace = cwd or "N/A"
+        lines = [
+            f"**\u5de5\u4f5c\u7a7a\u95f4**\uff1a`{workspace}`",
+            f"**\u4f1a\u8bdd ID**\uff1a`{sid or 'N/A'}`",
+        ]
+        if sid:
+            lines.append("\u5728\u4e0b\u65b9\u8f93\u5165\u63d0\u793a\u8bcd\uff0c\u7136\u540e\u70b9\u51fb\u201c\u7ee7\u7eed\u4f1a\u8bdd\u201d\u3002")
+        else:
+            lines.append("\u5f53\u524d\u6ca1\u6709 session_id\uff0c\u8bf7\u5148\u70b9\u51fb\u201c\u4f1a\u8bdd\u5217\u8868\u201d\u3002")
+
+        body_elements: list[dict[str, Any]] = [
+            {"tag": "markdown", "content": "\n".join(lines)}
+        ]
+
+        if sid:
+            body_elements.append(
+                {
+                    "tag": "input",
+                    "name": "resume_prompt",
+                    "placeholder": {
+                        "tag": "plain_text",
+                        "content": "\u8f93\u5165\u7eed\u5199\u63d0\u793a\u8bcd\uff08\u53ef\u9009\uff09",
+                    },
+                }
+            )
+            body_elements.append(
+                {
+                    "tag": "button",
+                    "type": "primary",
+                    "text": {"tag": "plain_text", "content": "\u7ee7\u7eed\u4f1a\u8bdd"},
+                    "value": {
+                        "nanobot_action": "cx_quick_continue",
+                        "session_id": sid,
+                    },
+                }
+            )
+
+        if run_name:
+            body_elements.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "\u67e5\u770b\u65e5\u5fd7"},
+                    "value": {"nanobot_cmd": f"/cx tail {run_name}"},
+                }
+            )
+        body_elements.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "\u4f1a\u8bdd\u5217\u8868"},
+                "value": {"nanobot_cmd": "/cx sessions 5"},
+            }
+        )
+
+        return {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "body": {"elements": body_elements},
+        }
 
     @staticmethod
     def _append_pending(pending: str, text: str) -> str:
@@ -835,7 +965,49 @@ class CodexService:
             f"/cx reject {run.name}\n"
             f"/cx pending"
         )
-        self._notify(run, message, fmt="markdown")
+        metadata: dict[str, Any] | None = None
+        if run.channel == "feishu":
+            metadata = {
+                "feishu_interactive_card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "Codex 审核请求"}
+                    },
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": (
+                                f"**Run:** `{run.name}`\n"
+                                f"**Workspace:** `{run.cwd}`\n\n"
+                                f"**Request:**\n{prompt_clean}"
+                            ),
+                        },
+                        {
+                            "tag": "action",
+                            "actions": [
+                                {
+                                    "tag": "button",
+                                    "type": "primary",
+                                    "text": {"tag": "plain_text", "content": "通过"},
+                                    "value": {"nanobot_cmd": f"/cx approve {run.name}"},
+                                },
+                                {
+                                    "tag": "button",
+                                    "type": "danger",
+                                    "text": {"tag": "plain_text", "content": "拒绝"},
+                                    "value": {"nanobot_cmd": f"/cx reject {run.name}"},
+                                },
+                                {
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": "查看待审"},
+                                    "value": {"nanobot_cmd": "/cx pending"},
+                                },
+                            ],
+                        },
+                    ],
+                }
+            }
+        self._notify(run, message, fmt="markdown", metadata=metadata)
 
     @staticmethod
     def _session_id_variants(session_id: str) -> set[str]:
@@ -999,6 +1171,8 @@ class CodexService:
             self._external_offsets = {k: v for k, v in self._external_offsets.items() if k in keep}
         if len(self._external_seen) > 2000:
             self._external_seen.clear()
+        if len(self._external_approval_seen) > 2000:
+            self._external_approval_seen.clear()
 
     @staticmethod
     def _iter_external_files(limit: int = 50) -> list[Path]:
@@ -1022,6 +1196,10 @@ class CodexService:
             if payload.get("id"):
                 self._external_meta[payload["id"]] = payload
             return
+
+        if sid:
+            self._maybe_notify_external_approval(path=path, obj=obj, sid=sid)
+
         if obj.get("type") != "event_msg":
             return
         payload = obj.get("payload") or {}
@@ -1054,20 +1232,68 @@ class CodexService:
             answer_msg = (
                 f"{last_msg}\n\n"
                 f"---\n"
-                f"**Workspace:** `{cwd}`\n"
-                f"**Session:** `{sid}`"
+                f"**工作空间**：`{cwd}`\n"
+                f"**会话 ID**：`{sid}`"
             )
             self._notify_route(channel, chat_id, answer_msg, fmt="markdown")
         summary_msg = (
-            f"### External Turn Finished\n\n"
-            f"**Workspace:** `{cwd}`\n"
-            f"**Session:** `{sid}`\n\n"
-            f"**Quick Continue**\n"
-            f"Copy and send one command:\n"
-            f"/cx resume {sid} [your prompt]\n"
+            f"### 外部会话本轮完成\n\n"
+            f"**工作空间**：`{cwd}`\n"
+            f"**会话 ID**：`{sid}`\n\n"
+            f"**快速继续**\n"
+            f"复制并发送以下命令之一：\n"
+            f"/cx resume {sid} [提示词]\n"
             f"/cx sessions 5"
         )
-        self._notify_route(channel, chat_id, summary_msg, fmt="markdown")
+        quick_meta = self._quick_continue_metadata(
+            channel=channel,
+            session_id=sid,
+            run_name=None,
+            cwd=cwd,
+            title="外部会话本轮完成",
+        )
+        self._notify_route(channel, chat_id, summary_msg, fmt="markdown", metadata=quick_meta)
+
+    def _maybe_notify_external_approval(self, path: Path, obj: dict[str, Any], sid: str) -> None:
+        """Send reminder when an external (non-managed) codex session asks for approval."""
+        prompt = self._extract_approval_prompt(obj)
+        if not prompt:
+            text = self._extract_text(obj) or self._extract_first_text(obj) or ""
+            prompt = self._extract_approval_prompt_from_text(text)
+        if not prompt:
+            return
+
+        meta = self._find_external_meta(sid)
+        if not meta:
+            if file_meta := self._read_session_meta(path):
+                meta = file_meta
+                if file_meta.get("id"):
+                    self._external_meta[file_meta["id"]] = file_meta
+        cwd = (meta or {}).get("cwd")
+        if self._is_owned_or_recent_local(sid, cwd):
+            return
+
+        prompt_clean = self._trim_output(prompt or "") or "Approval required."
+        sig = hashlib.sha1(f"{sid}|{prompt_clean}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+        event_key = f"{sid}:{sig}"
+        if event_key in self._external_approval_seen:
+            return
+        self._external_approval_seen.add(event_key)
+
+        route = self._get_notify_route()
+        if not route:
+            return
+        channel, chat_id = route
+        workspace = cwd or "N/A"
+        content = (
+            f"### External Approval Reminder\n\n"
+            f"**Workspace:** `{workspace}`\n"
+            f"**Session:** `{sid}`\n\n"
+            f"**Request**\n{prompt_clean}\n\n"
+            f"该会话由 PC 端外部启动，当前仅支持提醒。\n"
+            f"请在对应终端完成确认（例如输入 `y/n`）。"
+        )
+        self._notify_route(channel, chat_id, content, fmt="markdown")
 
     @staticmethod
     def _extract_session_id_from_path(path: Path) -> str | None:

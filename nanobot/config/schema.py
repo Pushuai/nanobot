@@ -216,6 +216,14 @@ class ExecToolConfig(BaseModel):
     timeout: int = 60
     allow_patterns: list[str] = Field(default_factory=list)
     deny_patterns: list[str] = Field(default_factory=list)
+    approval_enabled: bool = True  # Require approval for risky write/modify commands
+    approval_risk_patterns: list[str] = Field(default_factory=list)
+    approval_model_enabled: bool = False  # LLM-assisted risk classification
+    approval_model: str = ""  # Optional dedicated model for risk classification
+    approval_model_min_level: str = "medium"  # low | medium | high
+    approval_model_max_tokens: int = 200
+    approval_model_temperature: float = 0.0
+    approval_model_require_on_error: bool = False
     direct_enabled: bool = False  # Allow /exec direct commands
     direct_prefix: str = "/exec"
     direct_allow_patterns: list[str] = Field(default_factory=list)

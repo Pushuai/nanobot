@@ -1,0 +1,5 @@
+nanobot Starting nanobot gateway on port 18790...
+OK Channels enabled: feishu
+OK Heartbeat: every 30m
+OK Codex integration enabled
+[Lark] [2026-02-16 10:37:32,532] [INFO] connected to wss://msg-frontier.feishu.cn/ws/v2?fpid=493&aid=552564&device_id=7607286655993760698&access_key=3898852e3552895e4661ce892a397d43&service_id=33554678&ticket=5676f096-15e5-4506-ac33-03d088784bd9 [conn_id=7607286655993760698]
