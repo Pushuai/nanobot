@@ -73,7 +73,7 @@ class CodexService:
             str(Path(default_work_dir).expanduser()) if default_work_dir else os.getcwd()
         )
 
-        logs_dir = Path(config.logs_dir) if config.logs_dir else get_data_path() / "codex_runs"
+        logs_dir = Path(config.logs_dir) if config.logs_dir else get_data_path() / self._default_logs_dir_name()
         logs_dir.mkdir(parents=True, exist_ok=True)
         self._logs_dir = logs_dir
         self._state_path = logs_dir / "runs.json"
@@ -81,28 +81,47 @@ class CodexService:
         self._load_state()
         self._load_notify_state()
 
+    def _service_slug(self) -> str:
+        return "codex"
+
+    def _service_display_name(self) -> str:
+        return "Codex"
+
+    def _command_prefix(self) -> str:
+        prefix = (self.config.command_prefix or "").strip()
+        return prefix or "/cx"
+
+    def _sessions_root(self) -> Path:
+        return Path.home() / f".{self._service_slug()}" / "sessions"
+
+    def _default_logs_dir_name(self) -> str:
+        return f"{self._service_slug()}_runs"
+
+    def _default_temp_workspace_dir(self) -> str:
+        return f".{self._service_slug()}-temp-workspaces"
+
     async def start(self) -> None:
         if not self.config.enabled:
             return
         self._running = True
         self._loop = asyncio.get_running_loop()
-        logger.info("Codex service started")
+        logger.info(f"{self._service_display_name()} service started")
         while self._running:
             try:
                 self._poll_external_sessions()
             except Exception as e:
-                logger.debug(f"External codex poll skipped: {e}")
+                logger.debug(f"External {self._service_slug()} poll skipped: {e}")
             await asyncio.sleep(1)
 
     def stop(self) -> None:
         self._running = False
         self._save_state()
-        logger.info("Codex service stopping")
+        logger.info(f"{self._service_display_name()} service stopping")
 
     def list_runs_text(self, limit: int = 20) -> str:
         runs = list(self._runs.values())
         if not runs:
-            return "No codex runs tracked."
+            return f"No {self._service_slug()} runs tracked."
         runs = sorted(runs, key=lambda r: r.started_at, reverse=True)[:limit]
         lines = []
         for r in runs:
@@ -133,8 +152,12 @@ class CodexService:
             return f"Run {run.name} is not running."
         proc = self._get_proc(run.run_id)
         if not proc:
+            pid_killed = self._terminate_pid(run.pid)
             run.status = "stopped"
+            run.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save_state()
+            if pid_killed:
+                return f"Run {run.name} stopped (terminated pid {run.pid})."
             return f"Run {run.name} stopped (process not found)."
         try:
             proc.terminate()
@@ -205,21 +228,39 @@ class CodexService:
         chat_id: str,
         extra_args: list[str] | None = None,
     ) -> CodexRun:
+        requested_session = (session_id or "").strip() or None
+        if requested_session:
+            if existing := self._find_running_resume(requested_session):
+                # Keep latest notification target bound to current chat.
+                self.bind_notify_target(channel, chat_id)
+                return existing
+
+        resume_prompt = (prompt or "").strip()
+        if not resume_prompt:
+            # Non-interactive integration must always pass a prompt, otherwise
+            # codex may wait forever for stdin.
+            resume_prompt = "continue"
+
         args = ["exec", "resume"]
-        if session_id:
-            args.append(session_id)
+        if requested_session:
+            args.append(requested_session)
         args += self.config.resume_args
-        resume_cwd = self._resolve_resume_cwd(session_id)
-        return self._start_run(
+        resume_cwd = self._resolve_resume_cwd(requested_session)
+        run = self._start_run(
             name=name,
             base_args=args,
-            prompt=prompt,
+            prompt=resume_prompt,
             channel=channel,
             chat_id=chat_id,
             extra_args=extra_args or [],
             json_output=True,
             work_dir=resume_cwd,
         )
+        if requested_session:
+            run.session_id = requested_session
+            self._mark_owned_session_id(requested_session)
+            self._save_state()
+        return run
 
     def run_apply(
         self,
@@ -244,14 +285,14 @@ class CodexService:
     def list_sessions_text(self, limit: int = 10) -> str:
         sessions = self._list_codex_sessions(limit)
         if not sessions:
-            return "### Codex Sessions\n\nNo codex sessions found."
+            return f"### {self._service_display_name()} Sessions\n\nNo {self._service_slug()} sessions found."
 
         def _md_cell(value: Any) -> str:
             text = str(value or "-").replace("\n", " ").replace("|", "\\|").strip()
             return text or "-"
 
         lines = [
-            "### Codex Sessions",
+            f"### {self._service_display_name()} Sessions",
             "",
             "| # | Session ID | Updated | Workspace |",
             "|---:|---|---|---|",
@@ -266,7 +307,8 @@ class CodexService:
     def diff_files_text(self, target: str | None = None) -> str:
         label, cwd = self._resolve_diff_target(target)
         if not cwd:
-            return "No target workspace found. Try `/cx list` or `/cx sessions 5` first."
+            prefix = self._command_prefix()
+            return f"No target workspace found. Try `{prefix} list` or `{prefix} sessions 5` first."
         workspace = str(Path(cwd).expanduser())
         status = self._git_status_short(workspace)
         if status is None:
@@ -310,6 +352,7 @@ class CodexService:
             return "No pending approvals."
         pending = sorted(pending, key=lambda r: r.started_at, reverse=True)
         lines = ["### Pending Approvals", ""]
+        prefix = self._command_prefix()
         for r in pending:
             prompt = self._trim_output(r.approval_prompt or "")
             lines.extend([
@@ -317,8 +360,8 @@ class CodexService:
                 f"- Workspace: `{r.cwd}`",
                 f"- Prompt: {prompt or '(empty)'}",
                 f"- Actions:",
-                f"/cx approve {r.name}",
-                f"/cx reject {r.name}",
+                f"{prefix} approve {r.name}",
+                f"{prefix} reject {r.name}",
                 "",
             ])
         return "\n".join(lines).rstrip()
@@ -373,7 +416,7 @@ class CodexService:
         if self.config.temp_workspace_root:
             root = Path(self.config.temp_workspace_root).expanduser()
         else:
-            root = Path(self.get_effective_workdir()) / ".codex-temp-workspaces"
+            root = Path(self.get_effective_workdir()) / self._default_temp_workspace_dir()
         root.mkdir(parents=True, exist_ok=True)
         run_dir = root / f"run-{run_id}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -403,25 +446,26 @@ class CodexService:
         if self.config.max_running > 0:
             running = sum(1 for r in self._runs.values() if r.status == "running")
             if running >= self.config.max_running:
-                raise RuntimeError("Too many running codex tasks.")
+                raise RuntimeError(f"Too many running {self._service_slug()} tasks.")
         if not self._loop:
             try:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
                 pass
 
-        codex_exec = self._resolve_codex_path(self.config.codex_path)
-        if not codex_exec:
+        cli_exec = self._resolve_cli_path(self.config.codex_path)
+        if not cli_exec:
+            slug = self._service_slug()
             raise RuntimeError(
-                "codex executable not found. Set codex.codexPath to the full path "
-                "(e.g. C:\\Users\\<you>\\AppData\\Roaming\\npm\\codex.cmd)."
+                f"{slug} executable not found. Set {slug}.codexPath to the full path "
+                f"(e.g. C:\\Users\\<you>\\AppData\\Roaming\\npm\\{slug}.cmd)."
             )
 
         run_id = self._make_run_id()
-        run_name = name or f"codex-{run_id[-6:]}"
+        run_name = name or f"{self._service_slug()}-{run_id[-6:]}"
         log_path = self._logs_dir / f"{run_id}.log"
 
-        cmd = [codex_exec]
+        cmd = [cli_exec]
         cmd += self.config.default_args
         if self.config.model:
             cmd += ["--model", self.config.model]
@@ -494,7 +538,7 @@ class CodexService:
                     f.flush()
                     self._handle_line(run, line)
         except Exception as e:
-            logger.error(f"Codex output reader failed: {e}")
+            logger.error(f"{self._service_display_name()} output reader failed: {e}")
         finally:
             exit_code = proc.wait()
             run.exit_code = exit_code
@@ -631,7 +675,7 @@ class CodexService:
     ) -> None:
         if not self._loop:
             return
-        msg_metadata = {"format": fmt, "source": "codex"}
+        msg_metadata = {"format": fmt, "source": self._service_slug()}
         if metadata:
             msg_metadata.update(metadata)
         msg = OutboundMessage(
@@ -664,16 +708,17 @@ class CodexService:
         )
 
     def _quick_actions(self, run: CodexRun) -> str:
+        prefix = self._command_prefix()
         if run.session_id:
             commands = [
-                f"/cx resume {run.session_id} [\u63d0\u793a\u8bcd]",
-                f"/cx tail {run.name}",
+                f"{prefix} resume {run.session_id} [\u63d0\u793a\u8bcd]",
+                f"{prefix} tail {run.name}",
             ]
         else:
             commands = [
-                "/cx sessions 5",
-                "/cx resume [session_id] [\u63d0\u793a\u8bcd]",
-                f"/cx tail {run.name}",
+                f"{prefix} sessions 5",
+                f"{prefix} resume [session_id] [\u63d0\u793a\u8bcd]",
+                f"{prefix} tail {run.name}",
             ]
         cmd_block = "\n".join(commands)
         return (
@@ -701,13 +746,14 @@ class CodexService:
         )
         return {"feishu_interactive_card": card}
 
-    @staticmethod
     def _build_quick_continue_card(
+        self,
         session_id: str | None,
         run_name: str | None,
         cwd: str | None,
         title: str = "\u5feb\u901f\u7ee7\u7eed",
     ) -> dict[str, Any]:
+        prefix = self._command_prefix()
         sid = (session_id or "").strip()
         workspace = cwd or "N/A"
         lines = [
@@ -740,7 +786,8 @@ class CodexService:
                     "type": "primary",
                     "text": {"tag": "plain_text", "content": "\u7ee7\u7eed\u4f1a\u8bdd"},
                     "value": {
-                        "nanobot_action": "cx_quick_continue",
+                        "nanobot_action": "integration_quick_continue",
+                        "command_prefix": prefix,
                         "session_id": sid,
                     },
                 }
@@ -751,14 +798,14 @@ class CodexService:
                 {
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": "\u67e5\u770b\u65e5\u5fd7"},
-                    "value": {"nanobot_cmd": f"/cx tail {run_name}"},
+                    "value": {"nanobot_cmd": f"{prefix} tail {run_name}"},
                 }
             )
         body_elements.append(
             {
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "\u4f1a\u8bdd\u5217\u8868"},
-                "value": {"nanobot_cmd": "/cx sessions 5"},
+                "value": {"nanobot_cmd": f"{prefix} sessions 5"},
             }
         )
 
@@ -782,9 +829,8 @@ class CodexService:
             out = out[-self.config.stream.max_chars :]
         return out.strip()
 
-    @staticmethod
-    def _resolve_codex_path(candidate: str) -> str | None:
-        """Resolve codex executable path with Windows-friendly fallbacks."""
+    def _resolve_cli_path(self, candidate: str) -> str | None:
+        """Resolve integration CLI path with Windows-friendly fallbacks."""
         if not candidate:
             return None
         # Direct path
@@ -796,19 +842,29 @@ class CodexService:
             return found
         # Windows: try .cmd / .exe and common npm global path
         if os.name == "nt":
+            stem = Path(candidate).stem or self._service_slug()
             for suffix in (".cmd", ".exe"):
+                if candidate.lower().endswith(suffix):
+                    continue
                 found = shutil.which(candidate + suffix)
+                if found:
+                    return found
+                found = shutil.which(stem + suffix)
                 if found:
                     return found
             appdata = os.environ.get("APPDATA") or ""
             if appdata:
-                p = Path(appdata) / "npm" / "codex.cmd"
+                p = Path(appdata) / "npm" / f"{stem}.cmd"
                 if p.exists():
                     return str(p)
-            p = Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd"
+            p = Path.home() / "AppData" / "Roaming" / "npm" / f"{stem}.cmd"
             if p.exists():
                 return str(p)
         return None
+
+    def _resolve_codex_path(self, candidate: str) -> str | None:
+        """Backward-compatible alias for existing callers."""
+        return self._resolve_cli_path(candidate)
 
     @staticmethod
     def _extract_text(obj: dict[str, Any]) -> str | None:
@@ -907,7 +963,7 @@ class CodexService:
         if "approval" in typ or "approval" in ptype:
             return cls._extract_first_text(obj) or f"Approval requested ({typ or ptype})"
         if cls._json_has_approval_flag(obj):
-            return cls._extract_first_text(obj) or "Approval required by codex."
+            return cls._extract_first_text(obj) or "Approval required by integration."
         return None
 
     @classmethod
@@ -948,22 +1004,23 @@ class CodexService:
         return None
 
     def _set_pending_approval(self, run: CodexRun, prompt: str) -> None:
-        prompt_clean = self._trim_output(prompt or "") or "Approval required by codex."
+        prompt_clean = self._trim_output(prompt or "") or "Approval required by integration."
         if run.awaiting_approval and run.approval_prompt == prompt_clean:
             return
         run.awaiting_approval = True
         run.approval_prompt = prompt_clean
         run.approval_requested_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._save_state()
+        prefix = self._command_prefix()
         message = (
             f"### Approval Required\n\n"
             f"- Run: `{run.name}`\n"
             f"- Workspace: `{run.cwd}`\n\n"
             f"**Request**\n{prompt_clean}\n\n"
             f"**Actions**\n"
-            f"/cx approve {run.name}\n"
-            f"/cx reject {run.name}\n"
-            f"/cx pending"
+            f"{prefix} approve {run.name}\n"
+            f"{prefix} reject {run.name}\n"
+            f"{prefix} pending"
         )
         metadata: dict[str, Any] | None = None
         if run.channel == "feishu":
@@ -971,7 +1028,7 @@ class CodexService:
                 "feishu_interactive_card": {
                     "config": {"wide_screen_mode": True},
                     "header": {
-                        "title": {"tag": "plain_text", "content": "Codex 审核请求"}
+                        "title": {"tag": "plain_text", "content": f"{self._service_display_name()} 审核请求"}
                     },
                     "elements": [
                         {
@@ -989,18 +1046,18 @@ class CodexService:
                                     "tag": "button",
                                     "type": "primary",
                                     "text": {"tag": "plain_text", "content": "通过"},
-                                    "value": {"nanobot_cmd": f"/cx approve {run.name}"},
+                                    "value": {"nanobot_cmd": f"{prefix} approve {run.name}"},
                                 },
                                 {
                                     "tag": "button",
                                     "type": "danger",
                                     "text": {"tag": "plain_text", "content": "拒绝"},
-                                    "value": {"nanobot_cmd": f"/cx reject {run.name}"},
+                                    "value": {"nanobot_cmd": f"{prefix} reject {run.name}"},
                                 },
                                 {
                                     "tag": "button",
                                     "text": {"tag": "plain_text", "content": "查看待审"},
-                                    "value": {"nanobot_cmd": "/cx pending"},
+                                    "value": {"nanobot_cmd": f"{prefix} pending"},
                                 },
                             ],
                         },
@@ -1020,6 +1077,35 @@ class CodexService:
             sid.replace("_", "-"),
         }
 
+    @staticmethod
+    def _extract_resume_session_from_cmd(cmd: list[str]) -> str | None:
+        if not cmd:
+            return None
+        for i, token in enumerate(cmd):
+            if token != "resume":
+                continue
+            if i + 1 >= len(cmd):
+                return None
+            nxt = (cmd[i + 1] or "").strip()
+            if nxt and not nxt.startswith("-"):
+                return nxt
+            return None
+        return None
+
+    def _find_running_resume(self, session_id: str) -> CodexRun | None:
+        variants = self._session_id_variants(session_id)
+        if not variants:
+            return None
+        for run in self._runs.values():
+            if run.status != "running":
+                continue
+            sid = run.session_id or self._extract_resume_session_from_cmd(run.cmd)
+            if not sid:
+                continue
+            if variants & self._session_id_variants(sid):
+                return run
+        return None
+
     def _mark_owned_session_id(self, session_id: str | None) -> None:
         if not session_id:
             return
@@ -1027,7 +1113,7 @@ class CodexService:
             self._owned_session_ids.add(sid)
 
     def _list_codex_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
-        base = Path.home() / ".codex" / "sessions"
+        base = self._sessions_root()
         if not base.exists():
             return []
         files = list(base.rglob("rollout-*.jsonl"))
@@ -1095,7 +1181,7 @@ class CodexService:
         return proc.stdout.strip()
 
     def _find_session_meta(self, session_id: str) -> dict[str, Any] | None:
-        base = Path.home() / ".codex" / "sessions"
+        base = self._sessions_root()
         if not base.exists():
             return None
         files = list(base.rglob("rollout-*.jsonl"))
@@ -1112,7 +1198,7 @@ class CodexService:
     def _read_session_meta(path: Path) -> dict[str, Any] | None:
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
-                line = f.readline().strip()
+                line = f.readline().strip().lstrip("\ufeff")
             if not line:
                 return None
             obj = json.loads(line)
@@ -1174,9 +1260,8 @@ class CodexService:
         if len(self._external_approval_seen) > 2000:
             self._external_approval_seen.clear()
 
-    @staticmethod
-    def _iter_external_files(limit: int = 50) -> list[Path]:
-        base = Path.home() / ".codex" / "sessions"
+    def _iter_external_files(self, limit: int = 50) -> list[Path]:
+        base = self._sessions_root()
         if not base.exists():
             return []
         files = list(base.rglob("rollout-*.jsonl"))
@@ -1187,7 +1272,7 @@ class CodexService:
         if not raw:
             return
         try:
-            obj = json.loads(raw)
+            obj = json.loads(raw.lstrip("\ufeff"))
         except Exception:
             return
         sid = self._extract_session_id(obj) or self._extract_session_id_from_path(path)
@@ -1216,7 +1301,7 @@ class CodexService:
                     self._external_meta[file_meta["id"]] = file_meta
         cwd = (meta or {}).get("cwd")
         if self._is_owned_or_recent_local(sid, cwd):
-            logger.info(f"Skip external duplicate codex turn: session={sid}, cwd={cwd or 'N/A'}")
+            logger.info(f"Skip external duplicate {self._service_slug()} turn: session={sid}, cwd={cwd or 'N/A'}")
             return
         event_key = f"{sid}:{payload.get('turn_id') or obj.get('timestamp') or ''}"
         if event_key in self._external_seen:
@@ -1242,8 +1327,8 @@ class CodexService:
             f"**会话 ID**：`{sid}`\n\n"
             f"**快速继续**\n"
             f"复制并发送以下命令之一：\n"
-            f"/cx resume {sid} [提示词]\n"
-            f"/cx sessions 5"
+            f"{self._command_prefix()} resume {sid} [提示词]\n"
+            f"{self._command_prefix()} sessions 5"
         )
         quick_meta = self._quick_continue_metadata(
             channel=channel,
@@ -1344,12 +1429,14 @@ class CodexService:
     def _is_owned_or_recent_local(self, session_id: str | None, cwd: str | None) -> bool:
         if session_id:
             variants = self._session_id_variants(session_id)
-            if any(v in self._owned_session_ids for v in variants):
-                return True
             for run in self._runs.values():
-                if not run.session_id:
+                sid = run.session_id or self._extract_resume_session_from_cmd(run.cmd)
+                if not sid:
                     continue
-                if variants & self._session_id_variants(run.session_id):
+                # Avoid duplicate notifications only while local runs are active/recent.
+                if run.status != "running" and not self._is_run_recent(run):
+                    continue
+                if variants & self._session_id_variants(sid):
                     return True
         norm_cwd = self._normalize_path(cwd)
         if norm_cwd:
@@ -1448,6 +1535,13 @@ class CodexService:
                     approval_prompt=item.get("approval_prompt", ""),
                     approval_requested_at=item.get("approval_requested_at"),
                 )
+                if run.status == "running" and run.pid and not self._is_pid_alive(run.pid):
+                    run.status = "stopped"
+                    run.awaiting_approval = False
+                    run.approval_prompt = ""
+                    run.approval_requested_at = None
+                    if not run.finished_at:
+                        run.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if run.run_id:
                     self._runs[run.run_id] = run
                     self._mark_owned_session_id(run.session_id)
@@ -1484,6 +1578,51 @@ class CodexService:
     def _register_proc(self, run_id: str, proc: subprocess.Popen) -> None:
         # Store the proc in a private attribute to avoid serialization
         setattr(self, f"_proc_{run_id}", proc)
+
+    @staticmethod
+    def _is_pid_alive(pid: int | None) -> bool:
+        if not pid:
+            return False
+        try:
+            if os.name == "nt":
+                proc = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                )
+                if proc.returncode != 0:
+                    return False
+                out = (proc.stdout or "").strip()
+                return bool(out) and "No tasks are running" not in out
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _terminate_pid(pid: int | None) -> bool:
+        if not pid:
+            return False
+        try:
+            if os.name == "nt":
+                proc = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                )
+                return proc.returncode == 0
+            os.kill(pid, 15)
+            return True
+        except Exception:
+            return False
 
     def _get_proc(self, run_id: str) -> subprocess.Popen | None:
         return getattr(self, f"_proc_{run_id}", None)

@@ -55,6 +55,7 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         codex_service: "CodexService | None" = None,
+        antigravity_service: "AntigravityService | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -71,6 +72,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.codex = codex_service
+        self.antigravity = antigravity_service
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -435,25 +437,83 @@ class AgentLoop:
         if not content:
             return None
 
-        # Codex commands
-        if self.codex and self.codex.config.enabled:
-            prefix = (self.codex.config.command_prefix or "/cx").strip()
-            if prefix and content.startswith(prefix):
-                if not self._is_sender_allowed(
-                    msg.sender_id, self.codex.config.allow_from
-                ):
-                    return OutboundMessage(
-                        channel=msg.channel,
-                        chat_id=msg.chat_id,
-                        content="Access denied for codex commands.",
-                    )
-                cmdline = content[len(prefix):].strip()
-                reply = self._handle_codex_command(cmdline, msg)
+        # Codex CLI commands
+        integrations = [
+            (self.codex, "Codex", "codex", "/cx"),
+        ]
+        for service, label, source, default_prefix in integrations:
+            if not service or not service.config.enabled:
+                continue
+            prefix = (service.config.command_prefix or default_prefix).strip()
+            if not prefix or not content.startswith(prefix):
+                continue
+            if not self._is_sender_allowed(msg.sender_id, service.config.allow_from):
                 return OutboundMessage(
                     channel=msg.channel,
                     chat_id=msg.chat_id,
-                    content=reply,
-                    metadata={"format": "markdown", "source": "codex"},
+                    content=f"Access denied for {source} commands.",
+                )
+            cmdline = content[len(prefix):].strip()
+            reply = self._handle_codex_command(
+                cmdline=cmdline,
+                msg=msg,
+                service=service,
+                label=label,
+            )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=reply,
+                metadata={"format": "markdown", "source": source},
+            )
+
+        # Antigravity is listener-only: no in-chat run/resume commands.
+        ag_service = self.antigravity
+        ag_prefix = "/ag"
+        if ag_service:
+            ag_prefix = (ag_service.config.command_prefix or "/ag").strip() or "/ag"
+        if ag_prefix and (content == ag_prefix or content.startswith(ag_prefix + " ")):
+            if ag_service and ag_service.config.enabled:
+                ag_service.bind_notify_target(msg.channel, msg.chat_id)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        "Antigravity is running in listener-only mode.\n"
+                        "It only sends notifications when external sessions complete.\n"
+                        "This chat is now bound as the notify target."
+                    ),
+                    metadata={"format": "markdown", "source": "antigravity"},
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "Antigravity integration is not enabled.\n"
+                    "Set `antigravity.enabled=true` in `~/.nanobot/config.json` "
+                    "and restart `nanobot gateway`."
+                ),
+                metadata={"format": "markdown", "source": "antigravity"},
+            )
+
+        # If integration command is typed but service is disabled/not created,
+        # return a direct hint instead of falling through to the LLM.
+        for service, label, source, default_prefix in integrations:
+            prefix = default_prefix.strip()
+            if not prefix:
+                continue
+            if content == prefix or content.startswith(prefix + " "):
+                if service and service.config.enabled:
+                    continue
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        f"{label} integration is not enabled.\n"
+                        f"Set `{source}.enabled=true` in `~/.nanobot/config.json` "
+                        f"and restart `nanobot gateway`."
+                    ),
+                    metadata={"format": "markdown", "source": source},
                 )
 
         # Direct exec command
@@ -536,39 +596,57 @@ class AgentLoop:
 
         return None
 
-    def _handle_codex_command(self, cmdline: str, msg: InboundMessage) -> str:
+    def _handle_codex_command(
+        self,
+        cmdline: str,
+        msg: InboundMessage,
+        service: Any = None,
+        label: str = "Codex",
+    ) -> str:
+        svc = service or self.codex
+        if not svc:
+            return f"{label} service is not available."
+
+        prefix_getter = getattr(svc, "_command_prefix", None)
+        if callable(prefix_getter):
+            prefix = str(prefix_getter()).strip() or "/cx"
+        else:
+            prefix = (svc.config.command_prefix or "").strip() or "/cx"
+        arg_label = label.lower()
+        usage_run = f"Usage: {prefix} run [-n name] [--cwd path] [prompt] [-- [{arg_label} args]]"
+
         if not cmdline or cmdline in ("help", "/help", "?"):
-            workspace = self.codex.get_effective_workdir() if self.codex else str(self.workspace)
+            workspace = svc.get_effective_workdir()
             return "\n".join([
-                "### Codex Command Help",
+                f"### {label} Command Help",
                 "",
                 f"**Workspace:** `{workspace}`",
                 "",
                 "**Common Usage**",
-                "- Run once: `/cx run [prompt]`",
-                "- Run in directory: `/cx run --cwd [path] [prompt]`",
-                "- Continue session: `/cx resume [session_id] [prompt]`",
-                "- List sessions: `/cx sessions 10`",
-                "- Tail logs: `/cx tail [run_name] 80`",
+                f"- Run once: `{prefix} run [prompt]`",
+                f"- Run in directory: `{prefix} run --cwd [path] [prompt]`",
+                f"- Continue session: `{prefix} resume [session_id] [prompt]`",
+                f"- List sessions: `{prefix} sessions 10`",
+                f"- Tail logs: `{prefix} tail [run_name] 80`",
                 "",
                 "**Command List**",
-                "- `/cx run [prompt] [-- [codex args]]`",
-                "- `/cx run -n [name] [prompt] [-- [codex args]]`",
-                "- `/cx run --cwd [path] [prompt] [-- [codex args]]`",
-                "- `/cx review [prompt] [-- [codex args]]`",
-                "- `/cx resume [session_id] [prompt] [-- [codex args]]`",
-                "- `/cx apply [task_id] [-- [codex args]]`",
-                "- `/cx list`",
-                "- `/cx sessions [n]`",
-                "- `/cx diff [run_name|session_id|path]`",
-                "- `/cx tail <name> [lines]`",
-                "- `/cx stop <name>`",
-                "- `/cx pending`",
-                "- `/cx approve <name>`",
-                "- `/cx reject <name>`",
-                "- `/cx stream on|off`",
-                "- `/cx bind` / `/cx unbind`",
-                "- `/cx id`",
+                f"- `{prefix} run [prompt] [-- [{arg_label} args]]`",
+                f"- `{prefix} run -n [name] [prompt] [-- [{arg_label} args]]`",
+                f"- `{prefix} run --cwd [path] [prompt] [-- [{arg_label} args]]`",
+                f"- `{prefix} review [prompt] [-- [{arg_label} args]]`",
+                f"- `{prefix} resume [session_id] [prompt] [-- [{arg_label} args]]`",
+                f"- `{prefix} apply [task_id] [-- [{arg_label} args]]`",
+                f"- `{prefix} list`",
+                f"- `{prefix} sessions [n]`",
+                f"- `{prefix} diff [run_name|session_id|path]`",
+                f"- `{prefix} tail <name> [lines]`",
+                f"- `{prefix} stop <name>`",
+                f"- `{prefix} pending`",
+                f"- `{prefix} approve <name>`",
+                f"- `{prefix} reject <name>`",
+                f"- `{prefix} stream on|off`",
+                f"- `{prefix} bind` / `{prefix} unbind`",
+                f"- `{prefix} id`",
             ])
 
         parts = shlex.split(cmdline)
@@ -593,13 +671,13 @@ class AgentLoop:
                     token = args[i]
                     if token in ("-n", "--name"):
                         if i + 1 >= len(args):
-                            return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
+                            return usage_run
                         name = args[i + 1]
                         i += 2
                         continue
                     if token in ("-C", "--cwd", "--workdir"):
                         if i + 1 >= len(args):
-                            return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
+                            return usage_run
                         run_cwd = args[i + 1]
                         i += 2
                         continue
@@ -608,8 +686,8 @@ class AgentLoop:
 
                 prompt = " ".join(consumed).strip()
                 if not prompt:
-                    return "Usage: /cx run [-n name] [--cwd path] [prompt] [-- [codex args]]"
-                run = self.codex.run_exec(
+                    return usage_run
+                run = svc.run_exec(
                     prompt=prompt,
                     name=name,
                     channel=msg.channel,
@@ -631,7 +709,7 @@ class AgentLoop:
                     name = args[1]
                     args = args[2:]
                 prompt = " ".join(args).strip()
-                run = self.codex.run_review(
+                run = svc.run_review(
                     prompt=prompt,
                     name=name,
                     channel=msg.channel,
@@ -653,7 +731,7 @@ class AgentLoop:
                     args = args[2:]
                 session_id = args[0] if args else None
                 prompt = " ".join(args[1:]).strip() if args else ""
-                run = self.codex.run_resume(
+                run = svc.run_resume(
                     session_id=session_id,
                     prompt=prompt,
                     name=name,
@@ -672,9 +750,9 @@ class AgentLoop:
 
             if sub == "apply":
                 if not args:
-                    return "Usage: /cx apply [task_id] [-- [codex args]]"
+                    return f"Usage: {prefix} apply [task_id] [-- [{arg_label} args]]"
                 task_id = args[0]
-                run = self.codex.run_apply(
+                run = svc.run_apply(
                     task_id=task_id,
                     name=None,
                     channel=msg.channel,
@@ -690,65 +768,65 @@ class AgentLoop:
                 ])
 
             if sub in ("list", "status"):
-                return self.codex.list_runs_text()
+                return svc.list_runs_text()
 
             if sub == "sessions":
                 limit = 10
                 if args and args[0].isdigit():
                     limit = int(args[0])
-                return self.codex.list_sessions_text(limit=limit)
+                return svc.list_sessions_text(limit=limit)
 
             if sub == "diff":
                 target = args[0] if args else None
-                return self.codex.diff_files_text(target=target)
+                return svc.diff_files_text(target=target)
 
             if sub == "tail":
                 if not args:
-                    return "Usage: /cx tail [name] [lines]"
+                    return f"Usage: {prefix} tail [name] [lines]"
                 lines = 40
                 if len(args) > 1 and args[1].isdigit():
                     lines = int(args[1])
-                return self.codex.tail_run(args[0], lines=lines)
+                return svc.tail_run(args[0], lines=lines)
 
             if sub == "stop":
                 if not args:
-                    return "Usage: /cx stop [name]"
-                return self.codex.stop_run(args[0])
+                    return f"Usage: {prefix} stop [name]"
+                return svc.stop_run(args[0])
 
             if sub == "pending":
-                return self.codex.list_pending_text()
+                return svc.list_pending_text()
 
             if sub == "approve":
                 if not args:
-                    return "Usage: /cx approve [name]"
-                return self.codex.submit_approval(args[0], approved=True)
+                    return f"Usage: {prefix} approve [name]"
+                return svc.submit_approval(args[0], approved=True)
 
             if sub == "reject":
                 if not args:
-                    return "Usage: /cx reject [name]"
-                return self.codex.submit_approval(args[0], approved=False)
+                    return f"Usage: {prefix} reject [name]"
+                return svc.submit_approval(args[0], approved=False)
 
             if sub == "stream":
                 if not args:
-                    return "Usage: /cx stream on|off"
+                    return f"Usage: {prefix} stream on|off"
                 flag = args[0].lower() in ("on", "true", "1", "yes")
-                self.codex.set_stream_enabled(flag)
+                svc.set_stream_enabled(flag)
                 return f"Streaming {'enabled' if flag else 'disabled'}."
 
             if sub == "bind":
-                self.codex.bind_notify_target(msg.channel, msg.chat_id)
-                return "Bound current chat as codex notify target."
+                svc.bind_notify_target(msg.channel, msg.chat_id)
+                return f"Bound current chat as {label.lower()} notify target."
 
             if sub == "unbind":
-                self.codex.unbind_notify_target()
-                return "Cleared codex notify target."
+                svc.unbind_notify_target()
+                return f"Cleared {label.lower()} notify target."
 
             if sub == "id":
                 return f"chat_id: {msg.chat_id}\nsender_id: {msg.sender_id}"
 
-            return "Unknown command. Send '/cx' to view help."
+            return f"Unknown command. Send '{prefix}' to view help."
         except Exception as e:
-            return f"Codex error: {e}"
+            return f"{label} error: {e}"
 
     async def _assess_exec_risk(self, command: str, cwd: str) -> dict[str, Any] | None:
         """Optional model-assisted risk assessment for shell commands."""

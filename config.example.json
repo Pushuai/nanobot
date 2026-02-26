@@ -37,6 +37,22 @@
       "maxChars": 1200
     }
   },
+  "antigravity": {
+    "enabled": false,
+    "commandPrefix": "/ag",
+    "codexPath": "antigravity",
+    "sandbox": "danger-full-access",
+    "approvalPolicy": "never",
+    "reasoningMode": "xhigh",
+    "useTempWorkspace": true,
+    "tempWorkspaceRoot": "",
+    "stream": {
+      "enabled": true,
+      "minIntervalSeconds": 12,
+      "maxLines": 30,
+      "maxChars": 1200
+    }
+  },
   "tools": {
     "exec": {
       "directEnabled": true,

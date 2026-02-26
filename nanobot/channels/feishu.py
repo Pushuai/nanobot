@@ -3,7 +3,9 @@
 import asyncio
 import json
 import re
+import shlex
 import threading
+import time
 from datetime import datetime
 from collections import OrderedDict
 from typing import Any
@@ -117,6 +119,7 @@ class FeishuChannel(BaseChannel):
         self._ws_client: Any = None
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
+        self._processed_card_action_keys: OrderedDict[str, float] = OrderedDict()
         self._loop: asyncio.AbstractEventLoop | None = None
     
     async def start(self) -> None:
@@ -484,8 +487,9 @@ class FeishuChannel(BaseChannel):
                 return
             cmd = (value.get("nanobot_cmd") or "").strip()
             action_name = (value.get("nanobot_action") or "").strip()
-            if not cmd and action_name == "cx_quick_continue":
+            if not cmd and action_name in ("cx_quick_continue", "integration_quick_continue"):
                 sid = (value.get("session_id") or "").strip()
+                prefix = (value.get("command_prefix") or "").strip() or "/cx"
                 form_value = getattr(action, "form_value", None) if action else None
                 prompt = ""
                 if isinstance(form_value, dict):
@@ -501,12 +505,17 @@ class FeishuChannel(BaseChannel):
                         prompt = self._flatten_form_text(form_value).strip()
                 if not prompt:
                     prompt = self._flatten_form_text(getattr(action, "input_value", None)).strip()
+                if not prompt:
+                    prompt = self._flatten_form_text(value.get("resume_prompt")).strip()
+                if sid and not prompt:
+                    # Codex resume without prompt can block waiting for stdin.
+                    prompt = "continue"
                 if sid:
-                    cmd = f"/cx resume {sid}"
+                    cmd = f"{prefix} resume {sid}"
                     if prompt:
-                        cmd += f" {prompt}"
+                        cmd += f" {shlex.quote(prompt)}"
                 else:
-                    cmd = "/cx sessions 5"
+                    cmd = f"{prefix} sessions 5"
             if not cmd:
                 return
 
@@ -521,6 +530,18 @@ class FeishuChannel(BaseChannel):
                 (getattr(context, "open_chat_id", None) or "")
                 or sender_id
             )
+            message_id = getattr(context, "open_message_id", None) if context else None
+
+            # Deduplicate rapid duplicate card actions (e.g. double-click).
+            dedup_key = f"{sender_id}|{chat_id}|{message_id or ''}|{cmd}"
+            now = time.time()
+            last_ts = self._processed_card_action_keys.get(dedup_key)
+            if last_ts and (now - last_ts) < 4:
+                logger.info(f"Ignore duplicate Feishu card action: sender={sender_id} cmd={cmd}")
+                return
+            self._processed_card_action_keys[dedup_key] = now
+            while len(self._processed_card_action_keys) > 1000:
+                self._processed_card_action_keys.popitem(last=False)
 
             logger.info(f"Feishu card action: sender={sender_id} chat_id={chat_id} cmd={cmd}")
             await self._handle_message(
@@ -530,7 +551,7 @@ class FeishuChannel(BaseChannel):
                 metadata={
                     "source": "feishu_card_action",
                     "card_action": value,
-                    "message_id": getattr(context, "open_message_id", None) if context else None,
+                    "message_id": message_id,
                 },
             )
         except Exception as e:

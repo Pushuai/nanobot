@@ -334,6 +334,7 @@ def gateway(
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
     from nanobot.codex.service import CodexService
+    from nanobot.antigravity.service import AntigravityService
     
     if verbose:
         import logging
@@ -358,6 +359,13 @@ def gateway(
             bus,
             default_work_dir=str(config.workspace_path),
         )
+    antigravity_service = None
+    if config.antigravity.enabled:
+        antigravity_service = AntigravityService(
+            config.antigravity,
+            bus,
+            default_work_dir=str(config.workspace_path),
+        )
 
     agent = AgentLoop(
         bus=bus,
@@ -375,6 +383,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         codex_service=codex_service,
+        antigravity_service=antigravity_service,
     )
     
     # Set cron callback (needs agent)
@@ -423,6 +432,8 @@ def gateway(
     console.print(f"[green]{_CHECK}[/green] Heartbeat: every 30m")
     if codex_service:
         console.print(f"[green]{_CHECK}[/green] Codex integration enabled")
+    if antigravity_service:
+        console.print(f"[green]{_CHECK}[/green] Antigravity integration enabled")
     
     async def run():
         try:
@@ -434,6 +445,8 @@ def gateway(
             ]
             if codex_service:
                 tasks.append(codex_service.start())
+            if antigravity_service:
+                tasks.append(antigravity_service.start())
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
@@ -443,6 +456,8 @@ def gateway(
             cron.stop()
             if codex_service:
                 codex_service.stop()
+            if antigravity_service:
+                antigravity_service.stop()
             agent.stop()
             await channels.stop_all()
     
@@ -553,6 +568,76 @@ def agent(
                 await agent_loop.close_mcp()
         
         asyncio.run(run_interactive())
+
+
+# ============================================================================
+# Utility Commands
+# ============================================================================
+
+
+@app.command("decode-pb")
+def decode_pb(
+    file: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        help="Path to protobuf .pb file",
+    ),
+    max_depth: int = typer.Option(3, "--max-depth", min=1, max=10, help="Max nested decode depth"),
+    as_json: bool = typer.Option(False, "--json", help="Print decoded structure as JSON"),
+    out: Path | None = typer.Option(None, "--out", "-o", help="Write output to a file"),
+):
+    """Decode a protobuf blob without needing a .proto schema."""
+    import json
+    from nanobot.utils.protobuf_raw_decode import (
+        decode_protobuf_blob,
+        extract_printable_strings,
+        format_decoded_fields,
+    )
+
+    source = file.expanduser()
+    data = source.read_bytes()
+    decoded = decode_protobuf_blob(data, max_depth=max_depth)
+    real_fields = [f for f in decoded if f.get("wire") != "trailing_bytes"]
+    strings = extract_printable_strings(data)
+
+    if as_json:
+        rendered = json.dumps(
+            {
+                "decoded": decoded,
+                "real_field_count": len(real_fields),
+                "string_preview": strings,
+                "note": (
+                    "No valid protobuf fields detected from wire decode. "
+                    "The blob may be wrapped, compressed, encrypted, or use another format."
+                    if not real_fields
+                    else ""
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    else:
+        rendered = format_decoded_fields(decoded)
+        if not real_fields:
+            rendered += (
+                "\n\n(no valid protobuf fields detected; "
+                "showing printable string fallback below)"
+            )
+            if strings:
+                rendered += "\n" + "\n".join(f"- {s}" for s in strings)
+
+    if out:
+        target = out.expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(rendered, encoding="utf-8")
+        console.print(f"[green]{_CHECK}[/green] Decoded output written to {target}")
+        return
+
+    console.print(Text(rendered))
 
 
 # ============================================================================

@@ -276,6 +276,12 @@ class CodexConfig(BaseModel):
     stream: CodexStreamConfig = Field(default_factory=CodexStreamConfig)
 
 
+class AntigravityConfig(CodexConfig):
+    """Antigravity CLI integration configuration."""
+    command_prefix: str = "/ag"
+    codex_path: str = "antigravity"
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
@@ -284,6 +290,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     codex: CodexConfig = Field(default_factory=CodexConfig)
+    antigravity: AntigravityConfig = Field(default_factory=AntigravityConfig)
     
     @property
     def workspace_path(self) -> Path:
