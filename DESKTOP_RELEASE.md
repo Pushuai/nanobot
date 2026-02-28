@@ -33,3 +33,12 @@
 - Rollback:
   - uninstall current MSI, install previous MSI
 - User data remains in `~/.nanobot` unless explicitly removed.
+
+## Auto Start
+- Register current-user startup task:
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\register_desktop_startup.ps1`
+- Remove startup task:
+  - `powershell -ExecutionPolicy Bypass -File .\scripts\unregister_desktop_startup.ps1`
+
+## Ops Runbook
+- See `DESKTOP_RUNBOOK.md` for install, startup, verification, upgrade, and rollback SOP.
