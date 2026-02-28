@@ -142,6 +142,13 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
+class DesktopChannelConfig(BaseModel):
+    """Desktop UI virtual channel configuration."""
+    enabled: bool = False
+    allow_from: list[str] = Field(default_factory=list)
+    default_chat_id: str = "desktop-ui"
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
@@ -153,6 +160,7 @@ class ChannelsConfig(BaseModel):
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
     qq: QQConfig = Field(default_factory=QQConfig)
+    desktop: DesktopChannelConfig = Field(default_factory=DesktopChannelConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -198,6 +206,17 @@ class GatewayConfig(BaseModel):
     """Gateway/server configuration."""
     host: str = "0.0.0.0"
     port: int = 18790
+
+
+class DesktopConfig(BaseModel):
+    """Desktop sidecar server configuration."""
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 18791
+    auth_token: str = ""
+    auto_start: bool = True
+    minimize_to_tray: bool = True
+    connect_timeout_ms: int = 3000
 
 
 class WebSearchConfig(BaseModel):
@@ -288,6 +307,7 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     codex: CodexConfig = Field(default_factory=CodexConfig)
     antigravity: AntigravityConfig = Field(default_factory=AntigravityConfig)

@@ -11,6 +11,11 @@
     }
   },
   "channels": {
+    "desktop": {
+      "enabled": false,
+      "allowFrom": [],
+      "defaultChatId": "desktop-ui"
+    },
     "feishu": {
       "enabled": true,
       "appId": "cli_xxx",
@@ -19,6 +24,15 @@
       "verificationToken": "",
       "allowFrom": []
     }
+  },
+  "desktop": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 18791,
+    "authToken": "",
+    "autoStart": true,
+    "minimizeToTray": true,
+    "connectTimeoutMs": 3000
   },
   "codex": {
     "enabled": true,

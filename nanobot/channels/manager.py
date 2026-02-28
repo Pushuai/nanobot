@@ -33,6 +33,17 @@ class ChannelManager:
     
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
+
+        # Desktop virtual channel
+        if getattr(self.config.channels, "desktop", None) and self.config.channels.desktop.enabled:
+            try:
+                from nanobot.channels.desktop import DesktopChannel
+                self.channels["desktop"] = DesktopChannel(
+                    self.config.channels.desktop, self.bus
+                )
+                logger.info("Desktop channel enabled")
+            except ImportError as e:
+                logger.warning(f"Desktop channel not available: {e}")
         
         # Telegram channel
         if self.config.channels.telegram.enabled:

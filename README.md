@@ -842,6 +842,7 @@ MCP tools are automatically discovered and registered on startup. The LLM can us
 | `nanobot agent --no-markdown` | Show plain-text replies |
 | `nanobot agent --logs` | Show runtime logs during chat |
 | `nanobot gateway` | Start the gateway |
+| `nanobot desktop-gateway` | Start desktop sidecar WS gateway (`desktop` virtual channel) |
 | `nanobot status` | Show status |
 | `nanobot channels login` | Link WhatsApp (scan QR) |
 | `nanobot channels status` | Show channel status |

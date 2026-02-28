@@ -464,6 +464,197 @@ def gateway(
     asyncio.run(run())
 
 
+@app.command("desktop-gateway")
+def desktop_gateway(
+    host: str | None = typer.Option(None, "--host", help="Desktop WS host (default from config)"),
+    port: int | None = typer.Option(None, "--port", "-p", help="Desktop WS port (default from config)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+):
+    """Start nanobot in desktop sidecar mode (local WS API + optional channels)."""
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+    from nanobot.channels.manager import ChannelManager
+    from nanobot.channels.desktop import DesktopChannel
+    from nanobot.session.manager import SessionManager
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.heartbeat.service import HeartbeatService
+    from nanobot.codex.service import CodexService
+    from nanobot.antigravity.service import AntigravityService
+    from nanobot.desktop.server import DesktopServer
+    from nanobot.desktop.runtime import RuntimeLock, get_desktop_data_dir, load_or_create_auth_token
+
+    if verbose:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+
+    config = load_config()
+    config.desktop.enabled = True
+    config.channels.desktop.enabled = True
+    if host:
+        config.desktop.host = host
+    if port is not None:
+        config.desktop.port = int(port)
+
+    desktop_data_dir = get_desktop_data_dir()
+    auth_token = load_or_create_auth_token(config.desktop.auth_token)
+    lock = RuntimeLock(desktop_data_dir / "runtime.lock")
+    try:
+        lock.acquire()
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"{_LOGO} Starting nanobot desktop gateway on ws://{config.desktop.host}:{config.desktop.port}/ws ..."
+    )
+
+    bus = MessageBus()
+    provider = _make_provider(config)
+    session_manager = SessionManager(config.workspace_path)
+
+    # Create cron service first (callback set after agent creation)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    # Create agent with cron service
+    codex_service = None
+    if config.codex.enabled:
+        codex_service = CodexService(
+            config.codex,
+            bus,
+            default_work_dir=str(config.workspace_path),
+        )
+    antigravity_service = None
+    if config.antigravity.enabled:
+        antigravity_service = AntigravityService(
+            config.antigravity,
+            bus,
+            default_work_dir=str(config.workspace_path),
+        )
+
+    agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        cron_service=cron,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        session_manager=session_manager,
+        mcp_servers=config.tools.mcp_servers,
+        codex_service=codex_service,
+        antigravity_service=antigravity_service,
+    )
+
+    # Set cron callback (needs agent)
+    async def on_cron_job(job: CronJob) -> str | None:
+        response = await agent.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "desktop",
+            chat_id=job.payload.to or config.channels.desktop.default_chat_id,
+        )
+        if job.payload.deliver and job.payload.to:
+            from nanobot.bus.events import OutboundMessage
+            await bus.publish_outbound(OutboundMessage(
+                channel=job.payload.channel or "desktop",
+                chat_id=job.payload.to,
+                content=response or ""
+            ))
+        return response
+
+    cron.on_job = on_cron_job
+
+    # Create heartbeat service
+    async def on_heartbeat(prompt: str) -> str:
+        return await agent.process_direct(prompt, session_key="heartbeat", channel="desktop")
+
+    heartbeat = HeartbeatService(
+        workspace=config.workspace_path,
+        on_heartbeat=on_heartbeat,
+        interval_s=30 * 60,  # 30 minutes
+        enabled=True
+    )
+
+    # Create channel manager (desktop channel included)
+    channels = ChannelManager(config, bus)
+    desktop_channel = channels.get_channel("desktop")
+    if not isinstance(desktop_channel, DesktopChannel):
+        console.print("[red]Desktop channel failed to initialize.[/red]")
+        lock.release()
+        raise typer.Exit(1)
+
+    desktop_server = DesktopServer(
+        desktop_config=config.desktop,
+        config=config,
+        channel_manager=channels,
+        session_manager=session_manager,
+        desktop_channel=desktop_channel,
+        auth_token=auth_token,
+        codex_service=codex_service,
+        antigravity_service=antigravity_service,
+    )
+
+    if channels.enabled_channels:
+        console.print(f"[green]{_CHECK}[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+    else:
+        console.print("[yellow]Warning: No channels enabled[/yellow]")
+
+    console.print(f"[green]{_CHECK}[/green] Desktop API: ws://{config.desktop.host}:{config.desktop.port}/ws")
+    console.print(f"[green]{_CHECK}[/green] Desktop auth token: {auth_token[:8]}...")
+    console.print(f"[green]{_CHECK}[/green] Desktop token file: {desktop_data_dir / 'token.json'}")
+
+    cron_status = cron.status()
+    if cron_status["jobs"] > 0:
+        console.print(f"[green]{_CHECK}[/green] Cron: {cron_status['jobs']} scheduled jobs")
+
+    console.print(f"[green]{_CHECK}[/green] Heartbeat: every 30m")
+    if codex_service:
+        console.print(f"[green]{_CHECK}[/green] Codex integration enabled")
+    if antigravity_service:
+        console.print(f"[green]{_CHECK}[/green] Antigravity integration enabled")
+
+    async def run():
+        try:
+            await desktop_server.start()
+            await cron.start()
+            await heartbeat.start()
+            tasks = [
+                agent.run(),
+                channels.start_all(),
+            ]
+            if codex_service:
+                tasks.append(codex_service.start())
+            if antigravity_service:
+                tasks.append(antigravity_service.start())
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            console.print("\nShutting down...")
+        finally:
+            await agent.close_mcp()
+            heartbeat.stop()
+            cron.stop()
+            if codex_service:
+                codex_service.stop()
+            if antigravity_service:
+                antigravity_service.stop()
+            agent.stop()
+            await desktop_server.stop()
+            await channels.stop_all()
+
+    try:
+        asyncio.run(run())
+    finally:
+        lock.release()
+
+
 
 
 # ============================================================================
@@ -710,6 +901,15 @@ def channels_status():
         "Slack",
         _CHECK if slack.enabled else _CROSS,
         slack_config
+    )
+
+    # Desktop
+    desktop = config.channels.desktop
+    desktop_cfg = f"default chat: {desktop.default_chat_id}" if desktop.enabled else "[dim]disabled[/dim]"
+    table.add_row(
+        "Desktop",
+        _CHECK if desktop.enabled else _CROSS,
+        desktop_cfg,
     )
 
     console.print(table)
