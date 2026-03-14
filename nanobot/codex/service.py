@@ -432,6 +432,11 @@ class CodexService:
             return mode
         return None
 
+    @staticmethod
+    def _toml_string(value: str) -> str:
+        """Return a TOML-compatible quoted string."""
+        return json.dumps(value)
+
     def _start_run(
         self,
         name: str | None,
@@ -471,8 +476,13 @@ class CodexService:
             cmd += ["--model", self.config.model]
         if self.config.sandbox:
             cmd += ["--sandbox", self.config.sandbox]
+            # `exec resume` may ignore global `--sandbox` in some CLI builds;
+            # mirror it via config override to keep behavior deterministic.
+            cmd += ["-c", f"sandbox_mode={self._toml_string(self.config.sandbox)}"]
         if self.config.approval_policy:
             cmd += ["--ask-for-approval", self.config.approval_policy]
+            # Same rationale as sandbox override above.
+            cmd += ["-c", f"approval_policy={self._toml_string(self.config.approval_policy)}"]
         if effort := self._reasoning_effort_value():
             cmd += ["-c", f'reasoning_effort="{effort}"']
         cmd += base_args
@@ -772,19 +782,36 @@ class CodexService:
         if sid:
             body_elements.append(
                 {
-                    "tag": "input",
-                    "name": "resume_prompt",
-                    "placeholder": {
-                        "tag": "plain_text",
-                        "content": "\u8f93\u5165\u7eed\u5199\u63d0\u793a\u8bcd\uff08\u53ef\u9009\uff09",
-                    },
+                    "tag": "form",
+                    "name": "resume_form",
+                    "elements": [
+                        {
+                            "tag": "input",
+                            "name": "resume_prompt",
+                            "placeholder": {
+                                "tag": "plain_text",
+                                "content": "\u8f93\u5165\u7eed\u5199\u63d0\u793a\u8bcd\uff08\u53ef\u9009\uff09",
+                            },
+                        },
+                        {
+                            "tag": "button",
+                            "type": "primary",
+                            "action_type": "form_submit",
+                            "name": "submit_resume",
+                            "text": {"tag": "plain_text", "content": "\u7ee7\u7eed\u4f1a\u8bdd"},
+                            "value": {
+                                "nanobot_action": "integration_quick_continue",
+                                "command_prefix": prefix,
+                                "session_id": sid,
+                            },
+                        },
+                    ],
                 }
             )
             body_elements.append(
                 {
                     "tag": "button",
-                    "type": "primary",
-                    "text": {"tag": "plain_text", "content": "\u7ee7\u7eed\u4f1a\u8bdd"},
+                    "text": {"tag": "plain_text", "content": "\u76f4\u63a5\u7ee7\u7eed\uff08\u65e0\u63d0\u793a\u8bcd\uff09"},
                     "value": {
                         "nanobot_action": "integration_quick_continue",
                         "command_prefix": prefix,

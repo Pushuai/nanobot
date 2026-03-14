@@ -22,3 +22,4 @@ botpy.log
 gateway.out.log
 gateway.err.log
 tests/
+*.log

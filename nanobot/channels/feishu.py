@@ -329,6 +329,27 @@ class FeishuChannel(BaseChannel):
             return " ".join([p for p in parts if p]).strip()
         return ""
 
+    @staticmethod
+    def _extract_resume_prompt(action: Any, value: dict[str, Any]) -> str:
+        """Extract resume prompt from Feishu card callback payload."""
+        form_value = getattr(action, "form_value", None) if action else None
+        prompt = ""
+        if isinstance(form_value, dict):
+            # Common shape: {"resume_prompt": "..."}
+            prompt = FeishuChannel._flatten_form_text(form_value.get("resume_prompt")).strip()
+            # Form submit shape: {"resume_form": {"resume_prompt": "..."}}
+            if not prompt:
+                nested = form_value.get("resume_form")
+                if isinstance(nested, dict):
+                    prompt = FeishuChannel._flatten_form_text(nested.get("resume_prompt")).strip()
+            if not prompt:
+                prompt = FeishuChannel._flatten_form_text(form_value).strip()
+        if not prompt:
+            prompt = FeishuChannel._flatten_form_text(getattr(action, "input_value", None)).strip()
+        if not prompt:
+            prompt = FeishuChannel._flatten_form_text(value.get("resume_prompt")).strip()
+        return prompt
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through Feishu."""
         if not self._client:
@@ -490,24 +511,13 @@ class FeishuChannel(BaseChannel):
             if not cmd and action_name in ("cx_quick_continue", "integration_quick_continue"):
                 sid = (value.get("session_id") or "").strip()
                 prefix = (value.get("command_prefix") or "").strip() or "/cx"
-                form_value = getattr(action, "form_value", None) if action else None
-                prompt = ""
-                if isinstance(form_value, dict):
-                    # Some Feishu payloads are flat: {"resume_prompt": "..."}
-                    prompt = self._flatten_form_text(form_value.get("resume_prompt")).strip()
-                    # Some are nested by form name: {"resume_form": {"resume_prompt": "..."}}
-                    if not prompt:
-                        nested = form_value.get("resume_form")
-                        if isinstance(nested, dict):
-                            prompt = self._flatten_form_text(nested.get("resume_prompt")).strip()
-                    # Fallback: flatten all keys for compatibility.
-                    if not prompt:
-                        prompt = self._flatten_form_text(form_value).strip()
-                if not prompt:
-                    prompt = self._flatten_form_text(getattr(action, "input_value", None)).strip()
-                if not prompt:
-                    prompt = self._flatten_form_text(value.get("resume_prompt")).strip()
+                prompt = self._extract_resume_prompt(action, value)
                 if sid and not prompt:
+                    logger.info(
+                        "Feishu quick continue missing prompt; fallback=continue "
+                        f"(sid={sid}, action_tag={getattr(action, 'tag', None)}, "
+                        f"action_name={getattr(action, 'name', None)})"
+                    )
                     # Codex resume without prompt can block waiting for stdin.
                     prompt = "continue"
                 if sid:
