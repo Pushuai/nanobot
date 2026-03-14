@@ -1,3 +1,12 @@
 @echo off
-cd /d D:\code\nanobot
-D:\code\nanobot\.venv\Scripts\python.exe -m nanobot gateway >> D:\code\nanobot\gateway.boot.log 2>&1
+setlocal
+
+set "ROOT=%~dp0"
+set "VBS=%ROOT%start_nanobot_gateway.vbs"
+
+if not exist "%VBS%" (
+  echo VBS launcher not found: "%VBS%"
+  exit /b 1
+)
+
+wscript.exe "%VBS%"
